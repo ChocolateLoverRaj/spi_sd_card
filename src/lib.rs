@@ -280,3 +280,32 @@ pub async fn command_9<Bus: SpiBus, Cs: OutputPin>(
     spi_bus.write(&[0xFF]).await.map_err(Error::SpiBus)?;
     result
 }
+
+pub async fn command_59<Bus: SpiBus, Cs: OutputPin>(
+    spi_bus: &mut Bus,
+    cs: &mut Cs,
+    crc_on: bool,
+) -> Result<(), Error<Bus::Error, Cs::Error>> {
+    cs.set_low().map_err(Error::CsPin)?;
+    let r1 = card_command(
+        spi_bus,
+        &format_command(59, {
+            let mut argument = Command59Argument::default();
+            argument.set(Command59Argument::CRC_ON, crc_on);
+            argument.bits()
+        }),
+    )
+    .await
+    .map_err(Error::SpiBus)?;
+    // We're not allowed to talk to other SPI devices between sending the command and receiving a response
+    let result = {
+        if r1 == R1::IN_IDLE_STATE || r1.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::BadR1(r1))
+        }
+    };
+    cs.set_high().map_err(Error::CsPin)?;
+    spi_bus.write(&[0xFF]).await.map_err(Error::SpiBus)?;
+    result
+}

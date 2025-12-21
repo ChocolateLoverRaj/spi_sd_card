@@ -144,3 +144,10 @@ impl CsdV2 {
         (u64::from(self.get_c_size()) + 1) * 512 * 1024
     }
 }
+
+bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+    pub struct Command59Argument: u32 {
+        const CRC_ON = 1 << 0;
+    }
+}
