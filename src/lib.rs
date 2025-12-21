@@ -356,3 +356,28 @@ pub async fn command_10<Bus: SpiBus, Cs: OutputPin>(
     spi_bus.write(&[0xFF]).await.map_err(Error::SpiBus)?;
     result
 }
+
+pub async fn command_13<Bus: SpiBus, Cs: OutputPin>(
+    spi_bus: &mut Bus,
+    cs: &mut Cs,
+) -> Result<R2Byte1, Error<Bus::Error, Cs::Error>> {
+    cs.set_low().map_err(Error::CsPin)?;
+    let r1 = card_command(spi_bus, &format_command(13, 0))
+        .await
+        .map_err(Error::SpiBus)?;
+    let result = {
+        if r1 == R1::IN_IDLE_STATE || r1.is_empty() {
+            let mut buffer = [0xFF; 1];
+            spi_bus
+                .transfer_in_place(&mut buffer)
+                .await
+                .map_err(Error::SpiBus)?;
+            Ok(R2Byte1::from_bits_retain(buffer[0]))
+        } else {
+            Err(Error::BadR1(r1))
+        }
+    };
+    cs.set_high().map_err(Error::CsPin)?;
+    spi_bus.write(&[0xFF]).await.map_err(Error::SpiBus)?;
+    result
+}

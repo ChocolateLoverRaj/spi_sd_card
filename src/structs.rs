@@ -32,7 +32,7 @@ bitflags! {
 
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub struct R2Byte2: u8 {
+    pub struct R2Byte1: u8 {
         const OUT_OF_RANGE_OR_CSD_OVERWRITE = 1 << 7;
         const ERASE_PARAM = 1 << 6;
         const WP_VIOLATION = 1 << 5;
