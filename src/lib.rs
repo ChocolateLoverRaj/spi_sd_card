@@ -1,3 +1,4 @@
+#![no_std]
 mod structs;
 
 use crc::{CRC_7_MMC, CRC_16_XMODEM, Crc};
