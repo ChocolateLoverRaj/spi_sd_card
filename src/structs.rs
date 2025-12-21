@@ -151,3 +151,51 @@ bitflags! {
         const CRC_ON = 1 << 0;
     }
 }
+
+bitfield! {
+    pub struct Cid(u128);
+
+    u8; pub get_mid, set_mid: 127, 120;
+    u16; pub get_oid, set_oid: 119, 104;
+    u64; pub get_pnm, set_pnm: 103, 64;
+    u8; pub get_prv, set_prv: 63, 56;
+    u32; pub get_psn, set_psn: 55, 24;
+    u16; _get_mdt, _set_mdt: 19, 8;
+    u8; pub get_crc, set_crc: 7, 1;
+    bool;
+    /// bit 0 is always 1
+    pub get_bit_0, set_bit_0: 0;
+}
+
+impl Cid {
+    pub fn get_mdt(&self) -> Mdt {
+        Mdt(self._get_mdt())
+    }
+}
+
+bitfield! {
+    /// 12-bit Manufacturing date
+    pub struct Mdt(u16);
+
+    u8;
+    /// January is `1`
+    pub get_month, set_month: 3, 0;
+
+    u8;
+    /// The year 2000 is `0`
+    pub get_year, set_year: 11, 4;
+}
+
+#[cfg(feature = "chrono")]
+impl Mdt {
+    /// Returns `None` if the month number is invalid
+    pub fn month(&self) -> Option<chrono::Month> {
+        use num_traits::FromPrimitive;
+        chrono::Month::from_u8(self.get_month().checked_sub(1)?)
+    }
+
+    /// Returns a number compatible with chrono's Calendar Date
+    pub fn year(&self) -> i32 {
+        self.get_year() as i32 + 2000
+    }
+}

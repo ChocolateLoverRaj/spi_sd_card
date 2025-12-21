@@ -309,3 +309,50 @@ pub async fn command_59<Bus: SpiBus, Cs: OutputPin>(
     spi_bus.write(&[0xFF]).await.map_err(Error::SpiBus)?;
     result
 }
+
+pub async fn command_10<Bus: SpiBus, Cs: OutputPin>(
+    spi_bus: &mut Bus,
+    cs: &mut Cs,
+) -> Result<u128, Error<Bus::Error, Cs::Error>> {
+    cs.set_low().map_err(Error::CsPin)?;
+    let r1 = card_command(spi_bus, &format_command(10, 0))
+        .await
+        .map_err(Error::SpiBus)?;
+    let result = if r1.is_empty() {
+        cs.set_high().map_err(Error::CsPin)?;
+        spi_bus.write(&[0xFF]).await.map_err(Error::SpiBus)?;
+        // We are allowed to talk to other SPI devices at this point
+        cs.set_low().map_err(Error::CsPin)?;
+        loop {
+            let mut buffer = [0xFF; 1];
+            spi_bus
+                .transfer_in_place(&mut buffer)
+                .await
+                .map_err(Error::SpiBus)?;
+            let byte = buffer[0];
+            if byte != 0xFF {
+                break;
+            } else {
+                // TODO: Timeout
+            }
+        }
+        let mut buffer = [0xFF; 18];
+        spi_bus
+            .transfer_in_place(&mut buffer)
+            .await
+            .map_err(Error::SpiBus)?;
+        let (cid, crc) = buffer.split_at(16);
+        let csd = <&[u8; 16]>::try_from(cid).unwrap();
+        let crc = u16::from_be_bytes(*<&[u8; 2]>::try_from(crc).unwrap());
+        if crc == Crc::<u16>::new(&CRC_16_XMODEM).checksum(csd) {
+            Ok(u128::from_be_bytes(*csd))
+        } else {
+            Err(Error::InvalidChecksum)
+        }
+    } else {
+        return Err(Error::BadR1(r1));
+    };
+    cs.set_high().map_err(Error::CsPin)?;
+    spi_bus.write(&[0xFF]).await.map_err(Error::SpiBus)?;
+    result
+}
