@@ -2,7 +2,6 @@
 mod structs;
 
 use crc::{CRC_7_MMC, CRC_16_XMODEM, Crc};
-use defmt::warn;
 use embassy_time::Timer;
 use embedded_hal::digital::OutputPin;
 use embedded_hal_async::spi::SpiBus;
@@ -28,36 +27,25 @@ pub fn format_command(command_index: u8, argument: u32) -> [u8; 6] {
     command
 }
 
-pub fn format_command_0() -> [u8; 6] {
-    format_command(0, 0)
-}
-
-pub fn format_command_8(
-    ask_pcie_1_2v_support: bool,
-    ask_pcie_availability: bool,
-    ask_voltage_accepted: VoltageAccpted,
-    check_pattern: u8,
-) -> [u8; 6] {
-    format_command(8, {
-        let mut argument = Command8Argument(Default::default());
-        argument.set_pcie1_2v_support(ask_pcie_1_2v_support);
-        argument.set_pcie_availability(ask_pcie_availability);
-        argument.set_voltage_accepted(ask_voltage_accepted.bits());
-        argument.set_check_pattern(check_pattern);
-        argument.0
-    })
-}
-
+/// Some errors, such as the SpiBus and CsPin error, can happen from any command
+/// Other errors are command-specific and may never occur in certain commands
 #[derive(Debug)]
-pub enum SpiError<BusError, CsError> {
-    Bus(BusError),
-    Cs(CsError),
-}
-
-#[derive(Debug)]
-pub enum Command0Error<BusError, CsError> {
-    Spi(SpiError<BusError, CsError>),
-    R1Error(R1),
+pub enum Error<BusError, CsError> {
+    /// Error doing SPI transactions
+    /// If this error happens, the CS pin might still be set low
+    SpiBus(BusError),
+    /// Error setting the level of the CS pin
+    /// If this happens, the CS pin might still be set low
+    CsPin(CsError),
+    /// Many commands have this error if the response R1 from the SD card is something that it should not be
+    BadR1(R1),
+    /// Command 8 - the card's check pattern does not match the check pattern we sent to the card
+    CheckPatternMismatch(u8),
+    /// Command 8 - the SD Card does not support 3.3V
+    VoltageNotSupported,
+    /// For many commands, the card sends a checksum with its data response.
+    /// If the checksum doesn't match, then this error will occur.
+    InvalidChecksum,
 }
 
 /// Does not modify CS
@@ -80,38 +68,21 @@ pub async fn card_command<S: SpiBus>(spi_bus: &mut S, command: &[u8; 6]) -> Resu
 pub async fn command_0<Bus: SpiBus, Cs: OutputPin>(
     spi_bus: &mut Bus,
     cs: &mut Cs,
-) -> Result<(), Command0Error<Bus::Error, Cs::Error>> {
-    cs.set_low()
-        .map_err(SpiError::Cs)
-        .map_err(Command0Error::Spi)?;
+) -> Result<(), Error<Bus::Error, Cs::Error>> {
+    cs.set_low().map_err(Error::CsPin)?;
     let result = {
-        let r1 = card_command(spi_bus, &format_command_0())
+        let r1 = card_command(spi_bus, &format_command(0, 0))
             .await
-            .map_err(|e| Command0Error::Spi(SpiError::Bus(e)))?;
+            .map_err(Error::SpiBus)?;
         if r1 == R1::IN_IDLE_STATE {
             Ok(())
         } else {
-            Err(Command0Error::R1Error(r1))
+            Err(Error::BadR1(r1))
         }
     };
-    cs.set_high()
-        .map_err(SpiError::Cs)
-        .map_err(Command0Error::Spi)?;
-    spi_bus
-        .write(&[0xFF])
-        .await
-        .map_err(|e| Command0Error::Spi(SpiError::Bus(e)))?;
+    cs.set_high().map_err(Error::CsPin)?;
+    spi_bus.write(&[0xFF]).await.map_err(Error::SpiBus)?;
     result
-}
-
-#[derive(Debug)]
-pub enum Command8Error<BusError, CsError> {
-    Spi(SpiError<BusError, CsError>),
-    /// Cards that don't support version 2 will send this
-    R1Error(R1),
-    CheckPatternMismatch(u8),
-    /// The SD Card does not support 3.3V
-    VoltageNotSupported,
 }
 
 /// This function assumes that you are providing 2.6V-3.6V to the SD card.
@@ -119,24 +90,28 @@ pub async fn command_8<Bus: SpiBus, Cs: OutputPin>(
     spi_bus: &mut Bus,
     cs: &mut Cs,
     check_pattern: u8,
-) -> Result<(), Command8Error<Bus::Error, Cs::Error>> {
-    cs.set_low()
-        .map_err(SpiError::Cs)
-        .map_err(Command8Error::Spi)?;
+) -> Result<(), Error<Bus::Error, Cs::Error>> {
+    cs.set_low().map_err(Error::CsPin)?;
     let r1 = card_command(
         spi_bus,
-        &format_command_8(false, false, VoltageAccpted::_2_7V_3_6V, check_pattern),
+        &format_command(8, {
+            let mut argument = Command8Argument(Default::default());
+            argument.set_pcie1_2v_support(false);
+            argument.set_pcie_availability(false);
+            argument.set_voltage_accepted(VoltageAccpted::_2_7V_3_6V.bits());
+            argument.set_check_pattern(check_pattern);
+            argument.0
+        }),
     )
     .await
-    .map_err(|e| Command8Error::Spi(SpiError::Bus(e)))?;
+    .map_err(Error::SpiBus)?;
     let result = {
         if r1 == R1::IN_IDLE_STATE {
             let mut buffer = [0xFF; 4];
             spi_bus
                 .transfer_in_place(&mut buffer)
                 .await
-                .map_err(SpiError::Bus)
-                .map_err(Command8Error::Spi)?;
+                .map_err(Error::SpiBus)?;
 
             let response_check_pattern = buffer[3];
             if response_check_pattern == check_pattern {
@@ -147,43 +122,29 @@ pub async fn command_8<Bus: SpiBus, Cs: OutputPin>(
                 {
                     Ok(())
                 } else {
-                    Err(Command8Error::VoltageNotSupported)
+                    Err(Error::VoltageNotSupported)
                 }
             } else {
-                Err(Command8Error::CheckPatternMismatch(response_check_pattern))
+                Err(Error::CheckPatternMismatch(response_check_pattern))
             }
         } else {
-            Err(Command8Error::R1Error(r1))
+            Err(Error::BadR1(r1))
         }
     };
-    cs.set_high()
-        .map_err(SpiError::Cs)
-        .map_err(Command8Error::Spi)?;
-    spi_bus
-        .write(&[0xFF])
-        .await
-        .map_err(SpiError::Bus)
-        .map_err(Command8Error::Spi)?;
+    cs.set_high().map_err(Error::CsPin)?;
+    spi_bus.write(&[0xFF]).await.map_err(Error::SpiBus)?;
 
     result
-}
-
-#[derive(Debug)]
-pub enum Command58Error<BusError, CsError> {
-    Spi(SpiError<BusError, CsError>),
-    R1Error(R1),
 }
 
 pub async fn command_58<Bus: SpiBus, Cs: OutputPin>(
     spi_bus: &mut Bus,
     cs: &mut Cs,
-) -> Result<Ocr, Command58Error<Bus::Error, Cs::Error>> {
-    cs.set_low()
-        .map_err(SpiError::Cs)
-        .map_err(Command58Error::Spi)?;
+) -> Result<Ocr, Error<Bus::Error, Cs::Error>> {
+    cs.set_low().map_err(Error::CsPin)?;
     let r1 = card_command(spi_bus, &format_command(58, 0))
         .await
-        .map_err(|e| Command58Error::Spi(SpiError::Bus(e)))?;
+        .map_err(Error::SpiBus)?;
     // We're not allowed to talk to other SPI devices between sending the command and receiving a response
     let result = {
         // CMD58 can be called before or after ACMD41
@@ -194,43 +155,27 @@ pub async fn command_58<Bus: SpiBus, Cs: OutputPin>(
             spi_bus
                 .transfer_in_place(&mut buffer)
                 .await
-                .map_err(SpiError::Bus)
-                .map_err(Command58Error::Spi)?;
+                .map_err(Error::SpiBus)?;
             let ocr = Ocr::from_bits_retain(u32::from_be_bytes(buffer));
             Ok(ocr)
         } else {
-            Err(Command58Error::R1Error(r1))
+            Err(Error::BadR1(r1))
         }
     };
-    cs.set_high()
-        .map_err(SpiError::Cs)
-        .map_err(Command58Error::Spi)?;
-    spi_bus
-        .write(&[0xFF])
-        .await
-        .map_err(SpiError::Bus)
-        .map_err(Command58Error::Spi)?;
+    cs.set_high().map_err(Error::CsPin)?;
+    spi_bus.write(&[0xFF]).await.map_err(Error::SpiBus)?;
     result
-}
-
-#[derive(Debug)]
-pub enum Command55Error<BusError, CsError> {
-    Spi(SpiError<BusError, CsError>),
-    R1Error(R1),
 }
 
 pub async fn command_55<Bus: SpiBus, Cs: OutputPin>(
     spi_bus: &mut Bus,
     cs: &mut Cs,
-) -> Result<(), Command55Error<Bus::Error, Cs::Error>> {
-    cs.set_low()
-        .map_err(SpiError::Cs)
-        .map_err(Command55Error::Spi)?;
+) -> Result<(), Error<Bus::Error, Cs::Error>> {
+    cs.set_low().map_err(Error::CsPin)?;
     spi_bus
         .write(&format_command(55, 0))
         .await
-        .map_err(SpiError::Bus)
-        .map_err(Command55Error::Spi)?;
+        .map_err(Error::SpiBus)?;
     // We're not allowed to talk to other SPI devices between sending the command and receiving a response
     let result = loop {
         // Timer::after(Duration::from_millis(1000)).await;
@@ -238,34 +183,25 @@ pub async fn command_55<Bus: SpiBus, Cs: OutputPin>(
         spi_bus
             .transfer_in_place(&mut buffer)
             .await
-            .map_err(SpiError::Bus)
-            .map_err(Command55Error::Spi)?;
+            .map_err(Error::SpiBus)?;
         let r1 = R1::from_bits_retain(buffer[0]);
         if !r1.contains(R1::BIT_7) {
-            break if r1 == R1::IN_IDLE_STATE {
+            // At thsi point, the card could be ready or not ready
+            // We can treat either R1 as ok
+            break if r1 == R1::IN_IDLE_STATE || r1.is_empty() {
                 Ok(())
             } else {
-                Err(Command55Error::R1Error(r1))
+                #[cfg(feature = "defmt")]
+                defmt::error!("r1: 0b{:08b}", r1.bits());
+                Err(Error::BadR1(r1))
             };
         } else {
             // TODO: Timeout
         }
     };
-    cs.set_high()
-        .map_err(SpiError::Cs)
-        .map_err(Command55Error::Spi)?;
-    spi_bus
-        .write(&[0xFF])
-        .await
-        .map_err(SpiError::Bus)
-        .map_err(Command55Error::Spi)?;
+    cs.set_high().map_err(Error::CsPin)?;
+    spi_bus.write(&[0xFF]).await.map_err(Error::SpiBus)?;
     result
-}
-
-#[derive(Debug)]
-pub enum CommandA41Error<BusError, CsError> {
-    Spi(SpiError<BusError, CsError>),
-    R1Error(R1),
 }
 
 /// Returns if the SD card is idle
@@ -273,10 +209,8 @@ pub async fn command_a41<Bus: SpiBus, Cs: OutputPin>(
     spi_bus: &mut Bus,
     cs: &mut Cs,
     host_supports_hcs: bool,
-) -> Result<bool, CommandA41Error<Bus::Error, Cs::Error>> {
-    cs.set_low()
-        .map_err(SpiError::Cs)
-        .map_err(CommandA41Error::Spi)?;
+) -> Result<bool, Error<Bus::Error, Cs::Error>> {
+    cs.set_low().map_err(Error::CsPin)?;
     let r1 = card_command(
         spi_bus,
         &format_command(41, {
@@ -286,51 +220,39 @@ pub async fn command_a41<Bus: SpiBus, Cs: OutputPin>(
         }),
     )
     .await
-    .map_err(|e| CommandA41Error::Spi(SpiError::Bus(e)))?;
+    .map_err(Error::SpiBus)?;
     // We're not allowed to talk to other SPI devices between sending the command and receiving a response
     let result = {
         if r1 == R1::IN_IDLE_STATE || r1.is_empty() {
             Ok(r1.contains(R1::IN_IDLE_STATE))
         } else {
-            Err(CommandA41Error::R1Error(r1))
+            Err(Error::BadR1(r1))
         }
     };
-    cs.set_high()
-        .map_err(SpiError::Cs)
-        .map_err(CommandA41Error::Spi)?;
-    spi_bus
-        .write(&[0xFF])
-        .await
-        .map_err(SpiError::Bus)
-        .map_err(CommandA41Error::Spi)?;
+    cs.set_high().map_err(Error::CsPin)?;
+    spi_bus.write(&[0xFF]).await.map_err(Error::SpiBus)?;
     result
 }
 
-#[derive(Debug)]
-pub enum Command9Error<BusError, CsError> {
-    Spi(SpiError<BusError, CsError>),
-    R1Error(R1),
-    InvalidChecksum,
-}
 pub async fn command_9<Bus: SpiBus, Cs: OutputPin>(
     spi_bus: &mut Bus,
     cs: &mut Cs,
-) -> Result<u128, Command9Error<Bus::Error, Cs::Error>> {
-    cs.set_low()
-        .map_err(SpiError::Cs)
-        .map_err(Command9Error::Spi)?;
+) -> Result<u128, Error<Bus::Error, Cs::Error>> {
+    cs.set_low().map_err(Error::CsPin)?;
     let r1 = card_command(spi_bus, &format_command(9, 0))
         .await
-        .map_err(|e| Command9Error::Spi(SpiError::Bus(e)))?;
+        .map_err(Error::SpiBus)?;
     let result = if r1.is_empty() {
-        // TODO: Are we allowed to talk to other SPI devices during this time?
+        cs.set_high().map_err(Error::CsPin)?;
+        spi_bus.write(&[0xFF]).await.map_err(Error::SpiBus)?;
+        // We are allowed to talk to other SPI devices at this point
+        cs.set_low().map_err(Error::CsPin)?;
         loop {
             let mut buffer = [0xFF; 1];
             spi_bus
                 .transfer_in_place(&mut buffer)
                 .await
-                .map_err(SpiError::Bus)
-                .map_err(Command9Error::Spi)?;
+                .map_err(Error::SpiBus)?;
             let byte = buffer[0];
             if byte != 0xFF {
                 break;
@@ -342,26 +264,19 @@ pub async fn command_9<Bus: SpiBus, Cs: OutputPin>(
         spi_bus
             .transfer_in_place(&mut buffer)
             .await
-            .map_err(SpiError::Bus)
-            .map_err(Command9Error::Spi)?;
+            .map_err(Error::SpiBus)?;
         let (csd, crc) = buffer.split_at(16);
         let csd = <&[u8; 16]>::try_from(csd).unwrap();
         let crc = u16::from_be_bytes(*<&[u8; 2]>::try_from(crc).unwrap());
         if crc == Crc::<u16>::new(&CRC_16_XMODEM).checksum(csd) {
             Ok(u128::from_be_bytes(*csd))
         } else {
-            Err(Command9Error::InvalidChecksum)
+            Err(Error::InvalidChecksum)
         }
     } else {
-        return Err(Command9Error::R1Error(r1));
+        return Err(Error::BadR1(r1));
     };
-    cs.set_high()
-        .map_err(SpiError::Cs)
-        .map_err(Command9Error::Spi)?;
-    spi_bus
-        .write(&[0xFF])
-        .await
-        .map_err(SpiError::Bus)
-        .map_err(Command9Error::Spi)?;
+    cs.set_high().map_err(Error::CsPin)?;
+    spi_bus.write(&[0xFF]).await.map_err(Error::SpiBus)?;
     result
 }
