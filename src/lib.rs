@@ -46,6 +46,8 @@ pub enum Error<BusError, CsError> {
     /// For many commands, the card sends a checksum with its data response.
     /// If the checksum doesn't match, then this error will occur.
     InvalidChecksum,
+    /// Received a byte after the response that is invalid
+    BadData(u8),
 }
 
 /// Does not modify CS
@@ -373,6 +375,60 @@ pub async fn command_13<Bus: SpiBus, Cs: OutputPin>(
                 .await
                 .map_err(Error::SpiBus)?;
             Ok(R2Byte1::from_bits_retain(buffer[0]))
+        } else {
+            Err(Error::BadR1(r1))
+        }
+    };
+    cs.set_high().map_err(Error::CsPin)?;
+    spi_bus.write(&[0xFF]).await.map_err(Error::SpiBus)?;
+    result
+}
+
+pub async fn command_17<Bus: SpiBus, Cs: OutputPin>(
+    spi_bus: &mut Bus,
+    cs: &mut Cs,
+    address: u32,
+    buffer: &mut [u8; 512],
+) -> Result<(), Error<Bus::Error, Cs::Error>> {
+    cs.set_low().map_err(Error::CsPin)?;
+    let r1 = card_command(spi_bus, &format_command(17, address))
+        .await
+        .map_err(Error::SpiBus)?;
+    let result = {
+        if r1.is_empty() {
+            // TOOD: Can we talk to other SPI devices during this time?
+            // Wait for start block token
+            let data = loop {
+                let mut buffer = [0xFF; 1];
+                spi_bus
+                    .transfer_in_place(&mut buffer)
+                    .await
+                    .map_err(Error::SpiBus)?;
+                if buffer[0] != 0xFF {
+                    break buffer[0];
+                } else {
+                    // TODO: Timeout
+                }
+            };
+            if data == START_BLOCK_TOKEN {
+                buffer.fill(0xFF);
+                spi_bus
+                    .transfer_in_place(buffer.as_mut_slice())
+                    .await
+                    .map_err(Error::SpiBus)?;
+                let mut crc = [0xFF; 2];
+                spi_bus
+                    .transfer_in_place(&mut crc)
+                    .await
+                    .map_err(Error::SpiBus)?;
+                if u16::from_be_bytes(crc) == Crc::<u16>::new(&CRC_16_XMODEM).checksum(buffer) {
+                    Ok(())
+                } else {
+                    Err(Error::InvalidChecksum)
+                }
+            } else {
+                Err(Error::BadData(data))
+            }
         } else {
             Err(Error::BadR1(r1))
         }

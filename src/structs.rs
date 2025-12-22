@@ -199,3 +199,5 @@ impl Mdt {
         self.get_year() as i32 + 2000
     }
 }
+
+pub const START_BLOCK_TOKEN: u8 = 0b1111_1110;
