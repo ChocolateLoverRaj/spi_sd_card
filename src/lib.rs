@@ -97,17 +97,15 @@ type Command = [u8; 6];
 /// It is better to overestimate and read extra bytes than to have to do an additional transaction.
 /// Based on my testing of 4 MicroSD cards, the most I've seen is 2
 /// But if other people have MicroSD cards that take longer, we can increase this const.
-const BYTES_UNTIL_RESPONSE: usize = 2;
-/// The number of 0xFF bytes returned by the card until we consider it a timeout
-const CMD_0_MAX_BYTES_UNTIL_RESPONSE: usize = 100;
-/// The number of 0xFF bytes returned by the card until we consider it a timeout
-const CMD_59_MAX_BYTES_UNTIL_RESPONSE: usize = 100;
+/// If the bytes vary by command, we can use a separate value for different commands.
+const COMMAND_BYTES_UNTIL_RESPONSE: usize = 2;
+const COMMAND_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// The buffer can have any data
 pub async fn card_command_2<S: SpiBus>(
     spi_bus: &mut S,
     command: &Command,
-    buffer: &mut [u8; size_of::<Command>() + BYTES_UNTIL_RESPONSE + 1],
+    buffer: &mut [u8; size_of::<Command>() + COMMAND_BYTES_UNTIL_RESPONSE + 1],
 ) -> Result<R1, S::Error> {
     let (command_buffer, dummy_buffer) = buffer.split_at_mut(size_of::<Command>());
     command_buffer.copy_from_slice(command);
@@ -164,7 +162,7 @@ pub async fn command_8<Bus: SpiBus, Cs: OutputPin>(
     cs: &mut Cs,
     check_pattern: u8,
 ) -> Result<(), Error<Bus::Error, Cs::Error>> {
-    let mut buffer = [0xFF; size_of::<Command>() + BYTES_UNTIL_RESPONSE + 5];
+    let mut buffer = [0xFF; size_of::<Command>() + COMMAND_BYTES_UNTIL_RESPONSE + 5];
     buffer[..size_of::<Command>()].copy_from_slice(&format_command(8, {
         let mut argument = Command8Argument(Default::default());
         argument.set_pcie1_2v_support(false);
@@ -781,7 +779,7 @@ async fn card_command_3<S: SpiBus>(
         SendCommand(usize),
         ReceiveResponseStart((Instant, bool)),
         /// Number of bytes of the response received so far
-        ReceiveResponse(NonZero<usize>),
+        ReceiveResponse(usize),
         ReceiveStartBlockToken,
         /// Number of bytes of the data received so far
         ReceiveData(usize),
@@ -802,9 +800,17 @@ async fn card_command_3<S: SpiBus>(
                     let bytes_to_send = size_of::<Command>() - bytes_sent;
                     let command_bytes_sent = min(bytes_to_send, bytes_to_process.len());
                     bytes_processed += command_bytes_sent;
-                    if bytes_to_send == command_bytes_sent {
+                    let new_bytes_sent = bytes_sent + command_bytes_sent;
+                    if new_bytes_sent == size_of::<Command>() {
                         phase = Phase::ReceiveResponseStart((Instant::now(), false));
+                    } else {
+                        phase = Phase::SendCommand(new_bytes_sent)
                     }
+                    defmt::info!(
+                        "send command phase: {}. new bytes sent: {}",
+                        bytes_sent,
+                        new_bytes_sent
+                    );
                 }
                 Phase::ReceiveResponseStart((start_time, data_received)) => {
                     // Scan for R1
@@ -831,9 +837,8 @@ async fn card_command_3<S: SpiBus>(
                         r1_index
                     );
                     if let Some(r1_index) = r1_index {
-                        response[0] = bytes_to_process[r1_index];
-                        bytes_processed += r1_index + 1;
-                        phase = Phase::ReceiveResponse(NonZero::new(1).unwrap());
+                        bytes_processed += r1_index;
+                        phase = Phase::ReceiveResponse(0);
                     } else if start_time.elapsed() >= response_timeout {
                         return Err(CardCommand3Error::ReceiveResponseTimeout(data_received));
                     } else {
@@ -843,13 +848,13 @@ async fn card_command_3<S: SpiBus>(
                 }
                 Phase::ReceiveResponse(bytes_received) => {
                     defmt::info!("receive response phase: {}", bytes_received);
-                    let bytes_to_receive = response.len() - bytes_received.get();
+                    let bytes_to_receive = response.len() - bytes_received;
                     let copy_len = min(bytes_to_receive, bytes_to_process.len());
-                    response[bytes_received.get()..bytes_received.get() + copy_len]
+                    response[bytes_received..bytes_received + copy_len]
                         .copy_from_slice(&bytes_to_process[..copy_len]);
                     bytes_processed += copy_len;
-                    let new_bytes_received = bytes_received.checked_add(copy_len).unwrap();
-                    if new_bytes_received.get() == response.len() {
+                    let new_bytes_received = bytes_received + copy_len;
+                    if new_bytes_received == response.len() {
                         match &operation {
                             None => break 'spi,
                             Some(CardCommandOperation::Read(_)) => {
@@ -970,7 +975,7 @@ async fn card_command_3<S: SpiBus>(
                 bytes_to_transfer
             }
             Phase::ReceiveResponse(bytes_received) => {
-                let bytes_to_transfer = (response.len() - bytes_received.get()
+                let bytes_to_transfer = (response.len() - bytes_received
                     + match &operation {
                         None => 0,
                         Some(CardCommandOperation::Read(ReadOperation {
@@ -1024,6 +1029,7 @@ async fn card_command_3<S: SpiBus>(
             }
             Phase::WriteData(_) => todo!(),
         };
+        assert_ne!(bytes_to_transfer, 0);
         spi.transfer_in_place(&mut buffer[..bytes_to_transfer])
             .await
             .map_err(CardCommand3Error::Spi)?;
@@ -1038,6 +1044,9 @@ async fn card_command_3<S: SpiBus>(
 }
 
 impl<Spi: SharedSpiBus<u8>, Cs: OutputPin, Delayer: DelayNs> SpiSdCard<Spi, Cs, Delayer> {
+    /// This assumes that the voltage you are providing to the SD card is 3.3V!
+    /// If for some reason you are not providing 3.3V, create an issue
+    /// so we can better check if the SD card is compatible with the voltage you are providing.
     pub fn new(spi: Spi, cs: Cs, delayer: Delayer) -> Self {
         Self { spi, cs, delayer }
     }
@@ -1050,15 +1059,18 @@ impl<Spi: SharedSpiBus<u8>, Cs: OutputPin, Delayer: DelayNs> SpiSdCard<Spi, Cs, 
 
         let mut spi = self.spi.lock().await;
 
-        // // Send 0xFF for at least 74 clock cycles according to the spec
-        // // So 9 bytes
+        // Send 0xFF for at least 74 clock cycles according to the spec
+        // So 9 bytes
         spi.write(&[0xFF; 9]).await.unwrap();
 
-        // Do CMD0
         self.cs.set_low().map_err(Error::CsPin)?;
+
+        let mut got_response = false;
+        // TODO: Gracefully handle failures (remember to set CS to high and write a 0xFF byte);
+        // Do CMD0
         {
-            let mut buffer = [0xFF; size_of::<Command>() + BYTES_UNTIL_RESPONSE + size_of::<R1>()];
-            let mut got_response = false;
+            let mut buffer = [Default::default();
+                size_of::<Command>() + COMMAND_BYTES_UNTIL_RESPONSE + size_of::<R1>()];
             let mut response = [Default::default(); 1];
             let mut attempt_number = 0;
             let max_attempts = 50;
@@ -1074,9 +1086,9 @@ impl<Spi: SharedSpiBus<u8>, Cs: OutputPin, Delayer: DelayNs> SpiSdCard<Spi, Cs, 
                     spi.deref_mut(),
                     &mut buffer,
                     &format_command(0, 0),
-                    BYTES_UNTIL_RESPONSE,
+                    COMMAND_BYTES_UNTIL_RESPONSE,
                     &mut response,
-                    Duration::from_millis(100),
+                    COMMAND_TIMEOUT,
                     None,
                 )
                 .await;
@@ -1097,10 +1109,136 @@ impl<Spi: SharedSpiBus<u8>, Cs: OutputPin, Delayer: DelayNs> SpiSdCard<Spi, Cs, 
                         warn!("Got response: {:x}, trying again..", r1.bits());
                     }
                 }
+                // TODO: Release SPI lock?
                 self.delayer.delay_us(10).await;
                 attempt_number += 1;
             }
         }?;
+
+        // Enable CRC
+        {
+            let mut buffer = [Default::default();
+                size_of::<Command>() + COMMAND_BYTES_UNTIL_RESPONSE + size_of::<R1>()];
+            let mut response = [Default::default(); 1];
+            card_command_3(
+                spi.deref_mut(),
+                &mut buffer,
+                &format_command(59, {
+                    let mut argument = Command59Argument::default();
+                    argument.set(Command59Argument::CRC_ON, true);
+                    argument.bits()
+                }),
+                COMMAND_BYTES_UNTIL_RESPONSE,
+                &mut response,
+                COMMAND_TIMEOUT,
+                None,
+            )
+            .await
+            .map_err(|e| match e {
+                CardCommand3Error::Spi(e) => Error::SpiBus(e),
+                CardCommand3Error::ReceiveResponseTimeout(command_got_response) => {
+                    if got_response | command_got_response {
+                        Error::InitFailed
+                    } else {
+                        Error::NoResponse
+                    }
+                }
+                _ => unreachable!(),
+            })?;
+            let r1 = R1::from_bits_retain(response[0]);
+            if r1 != R1::IN_IDLE_STATE {
+                return Err(Error::InitFailed);
+            }
+        }
+
+        // Do CMD8
+        {
+            let mut buffer = [Default::default();
+                size_of::<Command>() + COMMAND_BYTES_UNTIL_RESPONSE + size_of::<R7>()];
+            let mut response = [Default::default(); size_of::<R7>()];
+            // The check pattern can be anything we want
+            let check_pattern = 0xE2;
+            card_command_3(
+                spi.deref_mut(),
+                &mut buffer,
+                &format_command(8, {
+                    let mut argument = Command8Argument(Default::default());
+                    argument.set_pcie1_2v_support(false);
+                    argument.set_pcie_availability(false);
+                    argument.set_voltage_accepted(VoltageAccpted::_2_7V_3_6V.bits());
+                    argument.set_check_pattern(check_pattern);
+                    argument.0
+                }),
+                COMMAND_BYTES_UNTIL_RESPONSE,
+                &mut response,
+                COMMAND_TIMEOUT,
+                None,
+            )
+            .await
+            .map_err(|e| match e {
+                CardCommand3Error::Spi(e) => Error::SpiBus(e),
+                CardCommand3Error::ReceiveResponseTimeout(command_got_response) => {
+                    if got_response | command_got_response {
+                        Error::InitFailed
+                    } else {
+                        Error::NoResponse
+                    }
+                }
+                _ => unreachable!(),
+            })?;
+            let r1 = R1::from_bits_retain(response[0]);
+            if r1 == R1::ILLEGAL_COMMAND {
+                todo!("Handle version 1")
+            } else if r1 != R1::IN_IDLE_STATE {
+                return Err(Error::InitFailed);
+            }
+            let byte_3 = R7Byte3(response[3]);
+            if !byte_3
+                .get_voltage_accepted()
+                .contains(VoltageAccpted::_2_7V_3_6V)
+            {
+                return Err(Error::VoltageNotSupported);
+            }
+            if response[4] != check_pattern {
+                return Err(Error::InitFailed);
+            }
+        }
+
+        // Get OCR
+        {
+            let mut buffer = [Default::default();
+                size_of::<Command>() + COMMAND_BYTES_UNTIL_RESPONSE + size_of::<R3>()];
+            let mut response = [Default::default(); size_of::<R3>()];
+            card_command_3(
+                spi.deref_mut(),
+                &mut buffer,
+                &format_command(58, 0),
+                COMMAND_BYTES_UNTIL_RESPONSE,
+                &mut response,
+                COMMAND_TIMEOUT,
+                None,
+            )
+            .await
+            .map_err(|e| match e {
+                CardCommand3Error::Spi(e) => Error::SpiBus(e),
+                CardCommand3Error::ReceiveResponseTimeout(command_got_response) => {
+                    if got_response | command_got_response {
+                        Error::InitFailed
+                    } else {
+                        Error::NoResponse
+                    }
+                }
+                _ => unreachable!(),
+            })?;
+            let r1 = R1::from_bits_retain(response[0]);
+            if r1 != R1::IN_IDLE_STATE {
+                return Err(Error::InitFailed);
+            }
+            let ocr = Ocr::from_bits_retain(u32::from_be_bytes(response[1..5].try_into().unwrap()));
+            if !ocr.supports_3_3v() {
+                return Err(Error::VoltageNotSupported);
+            }
+        }
 
         Ok(())
     }

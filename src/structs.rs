@@ -45,12 +45,14 @@ bitflags! {
 }
 
 bitfield! {
+    #[derive(Debug)]
     pub struct R7Byte1(u8);
 
     u8; pub get_command_version, set_command_version: 7, 4;
 }
 
 bitfield! {
+    #[derive(Debug)]
     pub struct R7Byte3(u8);
 
     u8; _get_voltage_accepted, _set_volage_accepted: 3, 0;
@@ -60,6 +62,17 @@ impl R7Byte3 {
     pub fn get_voltage_accepted(&self) -> VoltageAccpted {
         VoltageAccpted::from_bits_retain(self._get_voltage_accepted())
     }
+}
+
+#[derive(Debug)]
+#[repr(C)]
+pub struct R7 {
+    pub byte_0: R1,
+    pub byte_1: R7Byte1,
+    /// All reserved bits
+    byte_2: u8,
+    pub byte_3: R7Byte3,
+    pub check_pattern: u8,
 }
 
 bitfield! {
@@ -96,6 +109,13 @@ bitflags! {
         const CARD_CAPACITY_STATUS = 1 << 30;
         const CARD_POWER_UP_STATUS = 1 << 31;
     }
+}
+
+#[derive(Debug)]
+#[repr(C)]
+pub struct R3 {
+    r1: R1,
+    ocr: Ocr,
 }
 
 impl Ocr {
