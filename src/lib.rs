@@ -3,13 +3,12 @@
 #[cfg(feature = "esp32c3")]
 mod dma;
 
-use core::{cmp::min, num::NonZero, time::Duration};
+use core::{cmp::min, num::NonZero, ops::DerefMut};
 
 use defmt::warn;
 #[cfg(feature = "esp32c3")]
 pub use dma::*;
 mod shared_spi_bus;
-use embedded_timers::clock::Clock;
 pub use shared_spi_bus::*;
 mod disk;
 
@@ -19,7 +18,7 @@ pub use disk::*;
 pub use util::*;
 
 use crc::{CRC_7_MMC, CRC_16_XMODEM, Crc};
-use embassy_time::{Instant, Timer};
+use embassy_time::{Duration, Instant, Timer};
 use embedded_hal::digital::OutputPin;
 use embedded_hal_async::{
     delay::DelayNs,
@@ -768,9 +767,8 @@ enum CardCommand3Error<SpiError> {
 }
 
 /// Supports all commands except for multi block read and write.
-async fn card_command_3<S: SpiBus, C: Clock>(
+async fn card_command_3<S: SpiBus>(
     spi: &mut S,
-    clock: &C,
     buffer: &mut [u8],
     command: &[u8; 6],
     expected_bytes_until_response: usize,
@@ -778,10 +776,10 @@ async fn card_command_3<S: SpiBus, C: Clock>(
     response_timeout: Duration,
     mut operation: Option<CardCommandOperation<'_>>,
 ) -> Result<(), CardCommand3Error<S::Error>> {
-    enum Phase<C: Clock> {
+    enum Phase {
         /// Bytes sent
         SendCommand(usize),
-        ReceiveResponseStart((C::Instant, bool)),
+        ReceiveResponseStart((Instant, bool)),
         /// Number of bytes of the response received so far
         ReceiveResponse(NonZero<usize>),
         ReceiveStartBlockToken,
@@ -791,18 +789,21 @@ async fn card_command_3<S: SpiBus, C: Clock>(
         ReceiveCrc(Option<u8>),
         WriteData(usize),
     }
-    let mut phase = Phase::<C>::SendCommand(0);
-    let mut number_of_bytes_to_process = 0;
+    let mut phase = Phase::SendCommand(0);
+    let mut buffer_valid_bytes = 0;
     'spi: loop {
-        while number_of_bytes_to_process > 0 {
-            let bytes_to_process = &mut buffer[..number_of_bytes_to_process];
+        defmt::info!("number of bytes to process: {}", buffer_valid_bytes);
+        let mut bytes_processed = 0;
+        while buffer_valid_bytes > bytes_processed {
+            let bytes_to_process = &mut buffer[bytes_processed..buffer_valid_bytes];
             match phase {
                 Phase::SendCommand(bytes_sent) => {
+                    defmt::info!("send command phase: {}", bytes_sent);
                     let bytes_to_send = size_of::<Command>() - bytes_sent;
                     let command_bytes_sent = min(bytes_to_send, bytes_to_process.len());
-                    number_of_bytes_to_process -= command_bytes_sent;
+                    bytes_processed += command_bytes_sent;
                     if bytes_to_send == command_bytes_sent {
-                        phase = Phase::ReceiveResponseStart((clock.now(), false));
+                        phase = Phase::ReceiveResponseStart((Instant::now(), false));
                     }
                 }
                 Phase::ReceiveResponseStart((start_time, data_received)) => {
@@ -811,6 +812,7 @@ async fn card_command_3<S: SpiBus, C: Clock>(
                     let mut data_received = data_received;
                     let r1_index = loop {
                         if let Some(&byte) = bytes_to_process.get(i) {
+                            defmt::info!("Byte: 0x{:02X}", byte);
                             if byte != 0xFF {
                                 data_received = true;
                                 if !R1::from_bits_retain(byte).contains(R1::BIT_7) {
@@ -822,27 +824,32 @@ async fn card_command_3<S: SpiBus, C: Clock>(
                         }
                         i += 1;
                     };
+                    defmt::info!(
+                        "receive response start phase: {}, {}. r1 index: {}",
+                        start_time,
+                        data_received,
+                        r1_index
+                    );
                     if let Some(r1_index) = r1_index {
                         response[0] = bytes_to_process[r1_index];
-                        number_of_bytes_to_process -= r1_index + 1;
+                        bytes_processed += r1_index + 1;
                         phase = Phase::ReceiveResponse(NonZero::new(1).unwrap());
-                    } else if (clock.now() - start_time) >= response_timeout {
+                    } else if start_time.elapsed() >= response_timeout {
                         return Err(CardCommand3Error::ReceiveResponseTimeout(data_received));
                     } else {
-                        number_of_bytes_to_process = 0;
+                        bytes_processed = buffer_valid_bytes;
                         phase = Phase::ReceiveResponseStart((start_time, data_received));
                     }
                 }
                 Phase::ReceiveResponse(bytes_received) => {
+                    defmt::info!("receive response phase: {}", bytes_received);
                     let bytes_to_receive = response.len() - bytes_received.get();
                     let copy_len = min(bytes_to_receive, bytes_to_process.len());
                     response[bytes_received.get()..bytes_received.get() + copy_len]
                         .copy_from_slice(&bytes_to_process[..copy_len]);
-                    number_of_bytes_to_process -= copy_len;
-                    if let Some(new_bytes_received) = NonZero::new(bytes_received.get() - copy_len)
-                    {
-                        phase = Phase::ReceiveResponse(new_bytes_received);
-                    } else {
+                    bytes_processed += copy_len;
+                    let new_bytes_received = bytes_received.checked_add(copy_len).unwrap();
+                    if new_bytes_received.get() == response.len() {
                         match &operation {
                             None => break 'spi,
                             Some(CardCommandOperation::Read(_)) => {
@@ -852,9 +859,12 @@ async fn card_command_3<S: SpiBus, C: Clock>(
                                 phase = Phase::WriteData(0);
                             }
                         }
+                    } else {
+                        phase = Phase::ReceiveResponse(new_bytes_received);
                     }
                 }
                 Phase::ReceiveStartBlockToken => {
+                    defmt::info!("receive start block token phase");
                     // Scan for token
                     if let Some((index, &byte)) = bytes_to_process
                         .iter()
@@ -862,7 +872,7 @@ async fn card_command_3<S: SpiBus, C: Clock>(
                         .find(|(_, byte)| **byte != 0xFF)
                     {
                         if byte == START_BLOCK_TOKEN {
-                            number_of_bytes_to_process -= index + 1;
+                            bytes_processed += index + 1;
                             phase = Phase::ReceiveData(0);
                         } else {
                             return Err(CardCommand3Error::ExpectedStartBlockToken);
@@ -870,6 +880,7 @@ async fn card_command_3<S: SpiBus, C: Clock>(
                     }
                 }
                 Phase::ReceiveData(bytes_received) => {
+                    defmt::info!("receive data phase: {}", bytes_received);
                     let operation =
                         if let Some(CardCommandOperation::Read(operation)) = &mut operation {
                             operation
@@ -880,7 +891,7 @@ async fn card_command_3<S: SpiBus, C: Clock>(
                     let copy_len = min(bytes_left, bytes_to_process.len());
                     operation.buffer[bytes_received..bytes_received + copy_len]
                         .copy_from_slice(&bytes_to_process[..copy_len]);
-                    number_of_bytes_to_process -= copy_len;
+                    bytes_processed += copy_len;
                     let new_bytes_received = bytes_received + copy_len;
                     if new_bytes_received == operation.buffer.len() {
                         phase = Phase::ReceiveCrc(None);
@@ -889,6 +900,7 @@ async fn card_command_3<S: SpiBus, C: Clock>(
                     }
                 }
                 Phase::ReceiveCrc(byte_0) => {
+                    defmt::info!("receive CRC phase: {}", byte_0);
                     if let Some(byte_0) = byte_0 {
                         let byte_1 = bytes_to_process[0];
                         let crc = u16::from_le_bytes([byte_0, byte_1]);
@@ -905,7 +917,7 @@ async fn card_command_3<S: SpiBus, C: Clock>(
                         }
                     } else {
                         let byte_0 = bytes_to_process[0];
-                        number_of_bytes_to_process -= 1;
+                        bytes_processed += 1;
                         phase = Phase::ReceiveCrc(Some(byte_0));
                     };
                 }
@@ -1015,7 +1027,12 @@ async fn card_command_3<S: SpiBus, C: Clock>(
         spi.transfer_in_place(&mut buffer[..bytes_to_transfer])
             .await
             .map_err(CardCommand3Error::Spi)?;
-        number_of_bytes_to_process = bytes_to_transfer;
+        buffer_valid_bytes = bytes_to_transfer;
+        defmt::info!(
+            "Transferred {} bytes and read: {}",
+            buffer_valid_bytes,
+            &mut buffer[..buffer_valid_bytes]
+        );
     }
     Ok(())
 }
@@ -1042,8 +1059,9 @@ impl<Spi: SharedSpiBus<u8>, Cs: OutputPin, Delayer: DelayNs> SpiSdCard<Spi, Cs, 
         {
             let mut buffer = [0xFF; size_of::<Command>() + BYTES_UNTIL_RESPONSE + size_of::<R1>()];
             let mut got_response = false;
+            let mut response = [Default::default(); 1];
             let mut attempt_number = 0;
-            let mut max_attempts = 50;
+            let max_attempts = 50;
             loop {
                 if attempt_number == max_attempts {
                     break Err(if got_response {
@@ -1052,52 +1070,35 @@ impl<Spi: SharedSpiBus<u8>, Cs: OutputPin, Delayer: DelayNs> SpiSdCard<Spi, Cs, 
                         Error::NoResponse
                     });
                 }
-                let mut is_first_transfer = true;
-                let mut bytes_read = 0;
-                let r1 = 'read_response: loop {
-                    if bytes_read >= CMD_0_MAX_BYTES_UNTIL_RESPONSE {
-                        break None;
+                let result = card_command_3(
+                    spi.deref_mut(),
+                    &mut buffer,
+                    &format_command(0, 0),
+                    BYTES_UNTIL_RESPONSE,
+                    &mut response,
+                    Duration::from_millis(100),
+                    None,
+                )
+                .await;
+                match result {
+                    Ok(_) => {
+                        got_response = true;
                     }
-                    if is_first_transfer {
-                        buffer[..size_of::<Command>()].copy_from_slice(&format_command(0, 0));
-                    } else {
-                        buffer.fill(0xFF);
+                    Err(CardCommand3Error::ReceiveResponseTimeout(data_received)) => {
+                        got_response |= data_received;
                     }
-                    defmt::info!("Buffer: {:02X}", buffer);
-                    spi.transfer_in_place(&mut buffer)
-                        .await
-                        .map_err(Error::SpiBus)?;
-                    let read_bytes = if is_first_transfer {
-                        &buffer[6..]
-                    } else {
-                        &buffer
-                    };
-                    let mut i = 0;
-                    loop {
-                        if let Some(&byte) = read_bytes.get(i) {
-                            let r1 = R1::from_bits_retain(byte);
-                            if !r1.contains(R1::BIT_7) {
-                                break 'read_response Some(r1);
-                            }
-                            bytes_read += 1;
-                            i += 1;
-                        } else {
-                            break;
-                        }
-                    }
-                    todo!();
-                    is_first_transfer = false;
-                };
-                if let Some(r1) = r1 {
-                    got_response = true;
+                    _ => {}
+                }
+                if result.is_ok() {
+                    let r1 = R1::from_bits_retain(response[0]);
                     if r1 == R1::IN_IDLE_STATE {
                         break Ok(());
                     } else {
                         warn!("Got response: {:x}, trying again..", r1.bits());
                     }
                 }
-                buffer[6..].fill(0xFF);
                 self.delayer.delay_us(10).await;
+                attempt_number += 1;
             }
         }?;
 

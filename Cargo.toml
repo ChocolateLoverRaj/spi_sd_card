@@ -13,7 +13,6 @@ embassy-sync = { version = "0.7.2", optional = true }
 embassy-time = "0.5.0"
 embedded-hal = "1.0.0"
 embedded-hal-async = "1.0.0"
-embedded-timers = "0.4.0"
 esp-hal = { version = "1.0.0", optional = true, features = ["unstable"] }
 num-traits = { version = "0.2.19", optional = true, default-features = false }
 
