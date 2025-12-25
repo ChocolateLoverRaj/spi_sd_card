@@ -5,7 +5,7 @@ pub trait Disk {
     type Address;
     type Error;
 
-    fn len(&self) -> Self::Address;
+    // fn len(&self) -> Self::Address;
     async fn read(&mut self, start: Self::Address, buffer: &mut [u8]) -> Result<(), Self::Error>;
     async fn write(&mut self, start: Self::Address, buffer: &[u8]) -> Result<(), Self::Error>;
 }

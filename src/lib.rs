@@ -100,6 +100,9 @@ type Command = [u8; 6];
 /// If the bytes vary by command, we can use a separate value for different commands.
 const COMMAND_BYTES_UNTIL_RESPONSE: usize = 2;
 const COMMAND_TIMEOUT: Duration = Duration::from_millis(100);
+/// This is just a guess
+const BYTES_UNTIL_CSD: usize = 2;
+const CSD_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// The buffer can have any data
 pub async fn card_command_2<S: SpiBus>(
@@ -755,6 +758,8 @@ const fn command_buffer_len(
     };
     len
 }
+
+#[derive(Debug)]
 enum CardCommand3Error<SpiError> {
     Spi(SpiError),
     /// `true` if any data that was not `0xFF` was received
@@ -913,16 +918,25 @@ async fn card_command_3<S: SpiBus>(
                     defmt::info!("receive CRC phase: {}", byte_0);
                     if let Some(byte_0) = byte_0 {
                         let byte_1 = bytes_to_process[0];
-                        let crc = u16::from_le_bytes([byte_0, byte_1]);
+                        let crc = u16::from_be_bytes([byte_0, byte_1]);
                         let operation =
                             if let Some(CardCommandOperation::Read(operation)) = &mut operation {
                                 operation
                             } else {
                                 unreachable!()
                             };
-                        if crc == Crc::<u16>::new(&CRC_16_XMODEM).checksum(&operation.buffer) {
+                        let expected_crc =
+                            Crc::<u16>::new(&CRC_16_XMODEM).checksum(&operation.buffer);
+
+                        if crc == expected_crc {
                             break 'spi;
                         } else {
+                            defmt::error!(
+                                "Data: {:02X}. Received CRC: 0x{:04X}. Expected CRC: 0x{:04X}.",
+                                operation.buffer,
+                                crc,
+                                expected_crc
+                            );
                             return Err(CardCommand3Error::InvalidCrc);
                         }
                     } else {
@@ -1058,7 +1072,8 @@ impl<Spi: SharedSpiBus<u8>, Cs: OutputPin, Delayer: DelayNs> SpiSdCard<Spi, Cs, 
 
     pub async fn init_card(
         &mut self,
-    ) -> Result<(), Error<<Spi::Bus as ErrorType>::Error, Cs::Error>> {
+    ) -> Result<SdCardDisk<'_, Spi, Cs, Delayer>, Error<<Spi::Bus as ErrorType>::Error, Cs::Error>>
+    {
         // Wait at least 1ms
         self.delayer.delay_ms(1).await;
 
@@ -1360,6 +1375,85 @@ impl<Spi: SharedSpiBus<u8>, Cs: OutputPin, Delayer: DelayNs> SpiSdCard<Spi, Cs, 
 
         defmt::info!("is SDHC or SDXC?: {}", ocr.supports_sdhc_or_sdxc());
 
-        Ok(())
+        Ok(SdCardDisk { sd_card: self })
+    }
+}
+
+pub struct SdCardDisk<'a, Spi, Cs, Delayer> {
+    sd_card: &'a mut SpiSdCard<Spi, Cs, Delayer>,
+}
+
+impl<Spi: SharedSpiBus<u8>, Cs: OutputPin, Delayer: DelayNs> Disk
+    for SdCardDisk<'_, Spi, Cs, Delayer>
+{
+    type Address = u64;
+    type Error = Error<<Spi::Bus as ErrorType>::Error, Cs::Error>;
+
+    async fn read(&mut self, start: Self::Address, buffer: &mut [u8]) -> Result<(), Self::Error> {
+        todo!()
+    }
+
+    async fn write(&mut self, start: Self::Address, buffer: &[u8]) -> Result<(), Self::Error> {
+        todo!()
+    }
+}
+
+impl<Spi: SharedSpiBus<u8>, Cs: OutputPin, Delayer: DelayNs> SdCardDisk<'_, Spi, Cs, Delayer> {
+    /// Returns the card capacity in bytes
+    pub async fn capacity(
+        &mut self,
+    ) -> Result<u64, Error<<Spi::Bus as ErrorType>::Error, Cs::Error>> {
+        let mut spi = self.sd_card.spi.lock().await;
+
+        self.sd_card.cs.set_low().map_err(Error::CsPin)?;
+
+        let csd = {
+            let mut buffer = [Default::default();
+                size_of::<Command>()
+                    + COMMAND_BYTES_UNTIL_RESPONSE
+                    + size_of::<R1>()
+                    + BYTES_UNTIL_CSD
+                    + size_of::<CsdV2>()];
+            let mut response = [Default::default(); size_of::<R1>()];
+            let mut csd_bytes = [Default::default(); size_of::<CsdV2>()];
+            card_command_3(
+                spi.deref_mut(),
+                &mut buffer,
+                &format_command(9, 0),
+                COMMAND_BYTES_UNTIL_RESPONSE,
+                &mut response,
+                COMMAND_TIMEOUT,
+                Some(CardCommandOperation::Read(ReadOperation {
+                    buffer: &mut csd_bytes,
+                    expected_bytes_until_data: BYTES_UNTIL_CSD,
+                    timeout: CSD_TIMEOUT,
+                })),
+            )
+            .await
+            .map_err(|e| match e {
+                CardCommand3Error::Spi(e) => Error::SpiBus(e),
+                CardCommand3Error::ReceiveResponseTimeout(command_got_response) => {
+                    if command_got_response {
+                        Error::InitFailed
+                    } else {
+                        Error::NoResponse
+                    }
+                }
+                CardCommand3Error::ExpectedStartBlockToken => Error::InitFailed,
+                CardCommand3Error::InvalidCrc => Error::InitFailed,
+            })?;
+            let r1 = R1::from_bits_retain(response[0]);
+            if !r1.is_empty() {
+                return Err(Error::InitFailed);
+            }
+            CsdV2(u128::from_be_bytes(csd_bytes))
+        };
+
+        spi.flush().await.map_err(Error::SpiBus)?;
+        self.sd_card.cs.set_high().map_err(Error::CsPin)?;
+        spi.write(&[0xFF]).await.map_err(Error::SpiBus)?;
+        spi.flush().await.map_err(Error::SpiBus)?;
+
+        Ok(csd.card_capacity_bytes())
     }
 }
