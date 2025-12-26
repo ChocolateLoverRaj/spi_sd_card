@@ -1,7 +1,11 @@
 #![no_std]
 #![allow(async_fn_in_trait)]
 
-use core::{fmt::Debug, ops::DerefMut};
+use core::{
+    cmp::{max, min},
+    fmt::Debug,
+    ops::DerefMut,
+};
 
 use defmt::warn;
 mod shared_spi_bus;
@@ -460,8 +464,6 @@ where
     type Error = Error<Spi::Bus, Cs::Error>;
 
     async fn read(&mut self, start: Self::Address, buffer: &mut [u8]) -> Result<(), Self::Error> {
-        assert!(buffer.len().is_multiple_of(512));
-        assert!(start.is_multiple_of(512));
         let mut spi = self.sd_card.spi.lock().await;
         spi.set_config(&self.sd_card._25_mhz_config)
             .map_err(Error::SpiSetConfig)?;
@@ -469,7 +471,6 @@ where
         self.sd_card.cs.set_low().map_err(Error::CsPin)?;
 
         let start_block = u32::try_from(start / 512).unwrap();
-        let end_block = u32::try_from((start + buffer.len() as u64).div_ceil(512)).unwrap();
 
         let before = Instant::now();
         if buffer.len() > 512 && self.enable_read_multiple {
@@ -489,11 +490,11 @@ where
                 Some(CardCommandOperation::Read(ReadOperation {
                     expected_bytes_until_data: BYTES_UNTIL_READ_DATA,
                     timeout: READ_TIMEOUT,
-                    parts: buffer.len() / 512,
+                    parts: (start as usize + buffer.len()).div_ceil(512) - start as usize / 512,
                     part_size: 512,
                     buffer: buffer,
                     crc_enabled: true,
-                    skip_bytes: 0,
+                    skip_bytes: start as usize % 512,
                 })),
             )
             .await
@@ -538,6 +539,7 @@ where
                     + 512
                     + size_of::<u16>()];
             let mut response = [Default::default(); size_of::<R1>()];
+            let end_block = u32::try_from((start + buffer.len() as u64).div_ceil(512)).unwrap();
             for (i, block_address) in (start_block..end_block).into_iter().enumerate() {
                 defmt::info!("Reading single block at 0x{:X}", block_address * 512);
                 card_command(
@@ -552,9 +554,21 @@ where
                         timeout: READ_TIMEOUT,
                         parts: 1,
                         part_size: 512,
-                        buffer: &mut buffer[512 * i..512 * (i + 1)],
+                        buffer: {
+                            let start_address = max(block_address as u64 * 512, start);
+                            let end_address = min(
+                                (block_address as u64 + 1) * 512,
+                                start + buffer.len() as u64,
+                            );
+                            &mut buffer
+                                [(start_address - start) as usize..(end_address - start) as usize]
+                        },
                         crc_enabled: true,
-                        skip_bytes: 0,
+                        skip_bytes: if block_address == start_block {
+                            start as usize % 512
+                        } else {
+                            0
+                        },
                     })),
                 )
                 .await

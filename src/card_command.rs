@@ -6,6 +6,7 @@ use embedded_hal_async::spi::SpiBus;
 
 use crate::{Command, R1, START_BLOCK_TOKEN};
 
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct ReadOperation<'a> {
     pub buffer: &'a mut [u8],
     pub expected_bytes_until_data: usize,
@@ -18,12 +19,14 @@ pub struct ReadOperation<'a> {
     pub skip_bytes: usize,
 }
 
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct WriteOperation<'a> {
     pub buffer: &'a [u8],
     pub expected_bytes_until_data: usize,
     pub timeout: Duration,
 }
 
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum CardCommandOperation<'a> {
     Read(ReadOperation<'a>),
     Write(WriteOperation<'a>),
@@ -53,6 +56,7 @@ pub async fn card_command<S: SpiBus>(
     response_timeout: Duration,
     mut operation: Option<CardCommandOperation<'_>>,
 ) -> Result<(), CardCommand3Error<S::Error>> {
+    defmt::trace!("Operations: {:#?}", operation);
     const CRC: Crc<u16> = Crc::<u16>::new(&CRC_16_XMODEM);
     #[cfg_attr(feature = "defmt", derive(defmt::Format))]
     #[derive(Debug)]
@@ -209,16 +213,38 @@ pub async fn card_command<S: SpiBus>(
                         } else {
                             unreachable!()
                         };
-                    let buffer_part_position = parts_read * operation.part_size;
-                    let bytes_left = operation.part_size - bytes_received;
-                    let copy_len = min(bytes_left, bytes_to_process.len());
-                    let bytes_to_add = &bytes_to_process[..copy_len];
-                    operation.buffer[buffer_part_position + bytes_received
-                        ..buffer_part_position + bytes_received + copy_len]
-                        .copy_from_slice(bytes_to_add);
-                    digest.update(&bytes_to_add);
-                    bytes_processed += copy_len;
-                    let new_bytes_received = bytes_received + copy_len;
+                    let bytes_left_to_read = operation.part_size - bytes_received;
+                    let read_len = min(bytes_left_to_read, bytes_to_process.len());
+                    let bytes_to_read = &bytes_to_process[..read_len];
+                    {
+                        let start = parts_read * operation.part_size + bytes_received;
+                        let (dest_start, src_start, copy_len) = if start < operation.skip_bytes {
+                            if start + read_len > operation.skip_bytes {
+                                // skip some of beginning
+                                let bytes_to_skip = operation.skip_bytes - bytes_received;
+                                (0, bytes_to_skip, read_len - bytes_to_skip)
+                            } else {
+                                // skip all bytes we read
+                                (0, 0, 0)
+                            }
+                        } else {
+                            // don't skip anything
+                            let start = start - operation.skip_bytes;
+                            (start, 0, read_len)
+                        };
+                        // check for end
+                        let copy_len = if dest_start + copy_len > operation.buffer.len() {
+                            let skip_end = dest_start + copy_len - operation.buffer.len();
+                            copy_len - skip_end
+                        } else {
+                            copy_len
+                        };
+                        operation.buffer[dest_start..dest_start + copy_len]
+                            .copy_from_slice(&bytes_to_read[src_start..src_start + copy_len]);
+                    }
+                    digest.update(&bytes_to_read);
+                    bytes_processed += read_len;
+                    let new_bytes_received = bytes_received + read_len;
                     if new_bytes_received == operation.part_size {
                         phase = Phase::ReceiveCrc((digest.finalize(), parts_read, None));
                     } else {
