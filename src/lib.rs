@@ -98,6 +98,9 @@ where
     // Send CSD errors
     SendCsdResponseTimeout,
     SendCsdResponseError,
+    SendCsdDataTimeout,
+    SendCsdUnexpectedData,
+    SendCsdInvalidCrc,
 }
 
 type Command = [u8; 6];
@@ -472,7 +475,8 @@ where
         if buffer.len() > 512 && self.enable_read_multiple {
             // for block_address in start_block..end_block {
             // The bigger this is, the better
-            let mut spi_buffer = [Default::default(); 8 * 1024];
+            // from my testing, 1024 can achieve super fast speeds and there is no need for larger than that
+            let mut spi_buffer = [Default::default(); 1024];
             let mut response = [Default::default(); size_of::<R1>()];
             // let mut block_bytes = [Default::default(); 512];
             card_command(
@@ -489,6 +493,7 @@ where
                     part_size: 512,
                     buffer: buffer,
                     crc_enabled: true,
+                    skip_bytes: 0,
                 })),
             )
             .await
@@ -549,6 +554,7 @@ where
                         part_size: 512,
                         buffer: &mut buffer[512 * i..512 * (i + 1)],
                         crc_enabled: true,
+                        skip_bytes: 0,
                     })),
                 )
                 .await
@@ -640,13 +646,16 @@ where
                     expected_bytes_until_data: BYTES_UNTIL_CSD,
                     timeout: CSD_TIMEOUT,
                     crc_enabled: true,
+                    skip_bytes: 0,
                 })),
             )
             .await
             .map_err(|e| match e {
                 CardCommand3Error::Spi(e) => Error::SpiBus(e),
                 CardCommand3Error::ReceiveResponseTimeout(_) => Error::SendCsdResponseTimeout,
-                _ => unreachable!(),
+                CardCommand3Error::ExpectedStartBlockToken => Error::SendCsdUnexpectedData,
+                CardCommand3Error::ReceiveDataTimeout(_) => Error::SendCsdDataTimeout,
+                CardCommand3Error::InvalidCrc => Error::SendCsdInvalidCrc,
             })?;
             let r1 = R1::from_bits_retain(response[0]);
             if !r1.is_empty() {

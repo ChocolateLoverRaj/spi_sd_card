@@ -21,3 +21,6 @@ default = []
 defmt = ["dep:defmt", "embassy-time/defmt"]
 chrono = ["dep:chrono", "dep:num-traits"]
 embassy-sync = ["dep:embassy-sync"]
+
+[patch.crates-io]
+crc = { path = "../crc-rs" }

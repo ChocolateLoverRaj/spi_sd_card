@@ -1,6 +1,6 @@
 use core::cmp::min;
 
-use crc::{CRC_16_XMODEM, Crc};
+use crc::{CRC_16_XMODEM, Crc, Digest};
 use embassy_time::{Duration, Instant};
 use embedded_hal_async::spi::SpiBus;
 
@@ -14,6 +14,8 @@ pub struct ReadOperation<'a> {
     pub parts: usize,
     pub part_size: usize,
     pub crc_enabled: bool,
+    /// Lets you skip the first bytes to read into a buffer that wants data starting at an address that is not a multiple of 512
+    pub skip_bytes: usize,
 }
 
 pub struct WriteOperation<'a> {
@@ -51,9 +53,10 @@ pub async fn card_command<S: SpiBus>(
     response_timeout: Duration,
     mut operation: Option<CardCommandOperation<'_>>,
 ) -> Result<(), CardCommand3Error<S::Error>> {
+    const CRC: Crc<u16> = Crc::<u16>::new(&CRC_16_XMODEM);
     #[cfg_attr(feature = "defmt", derive(defmt::Format))]
     #[derive(Debug)]
-    enum Phase {
+    enum Phase<'a> {
         /// Bytes sent
         SendCommand(usize),
         ReceiveResponseStart((Instant, bool)),
@@ -63,10 +66,10 @@ pub async fn card_command<S: SpiBus>(
         WaitUntilNotBusy(usize),
         /// Data: parts read
         ReceiveStartBlockToken((Instant, usize)),
-        /// Number of parts, number of bytes of the data received so far
-        ReceiveData((usize, usize)),
-        /// Number of parts read, The byte of the partial CRC received, if any
-        ReceiveCrc((usize, Option<u8>)),
+        /// Digest, Number of parts, number of bytes of the data received so far
+        ReceiveData((Digest<'a, u16>, usize, usize)),
+        /// Expected crc, Number of parts read, The byte of the partial CRC received, if any
+        ReceiveCrc((u16, usize, Option<u8>)),
         WriteData(usize),
     }
     let mut phase = Phase::SendCommand(0);
@@ -177,7 +180,7 @@ pub async fn card_command<S: SpiBus>(
                         bytes_processed += 1;
                         if byte != 0xFF {
                             if byte == START_BLOCK_TOKEN {
-                                phase = Phase::ReceiveData((parts_read, 0));
+                                phase = Phase::ReceiveData((CRC.digest(), parts_read, 0));
                                 break;
                             } else {
                                 defmt::error!(
@@ -198,7 +201,7 @@ pub async fn card_command<S: SpiBus>(
                         return Err(CardCommand3Error::ReceiveDataTimeout(parts_read));
                     }
                 }
-                Phase::ReceiveData((parts_read, bytes_received)) => {
+                Phase::ReceiveData((mut digest, parts_read, bytes_received)) => {
                     defmt::trace!("receive data phase: {}", bytes_received);
                     let operation =
                         if let Some(CardCommandOperation::Read(operation)) = &mut operation {
@@ -209,22 +212,24 @@ pub async fn card_command<S: SpiBus>(
                     let buffer_part_position = parts_read * operation.part_size;
                     let bytes_left = operation.part_size - bytes_received;
                     let copy_len = min(bytes_left, bytes_to_process.len());
+                    let bytes_to_add = &bytes_to_process[..copy_len];
                     operation.buffer[buffer_part_position + bytes_received
                         ..buffer_part_position + bytes_received + copy_len]
-                        .copy_from_slice(&bytes_to_process[..copy_len]);
+                        .copy_from_slice(bytes_to_add);
+                    digest.update(&bytes_to_add);
                     bytes_processed += copy_len;
                     let new_bytes_received = bytes_received + copy_len;
                     if new_bytes_received == operation.part_size {
-                        phase = Phase::ReceiveCrc((parts_read, None));
+                        phase = Phase::ReceiveCrc((digest.finalize(), parts_read, None));
                     } else {
-                        phase = Phase::ReceiveData((parts_read, new_bytes_received));
+                        phase = Phase::ReceiveData((digest, parts_read, new_bytes_received));
                         defmt::trace!(
                             "did not receive all data in a single transfer (missing {} bytes)",
                             operation.part_size - new_bytes_received
                         );
                     }
                 }
-                Phase::ReceiveCrc((parts_read, byte_0)) => {
+                Phase::ReceiveCrc((expected_crc, parts_read, byte_0)) => {
                     defmt::trace!("receive CRC phase: {}", byte_0);
                     if let Some(byte_0) = byte_0 {
                         let byte_1 = bytes_to_process[0];
@@ -236,10 +241,6 @@ pub async fn card_command<S: SpiBus>(
                             } else {
                                 unreachable!()
                             };
-                        let buffer_position = parts_read * operation.part_size;
-                        let data = &operation.buffer
-                            [buffer_position..buffer_position + operation.part_size];
-                        let expected_crc = Crc::<u16>::new(&CRC_16_XMODEM).checksum(data);
 
                         if crc == expected_crc || !operation.crc_enabled {
                             let new_parts_read = parts_read + 1;
@@ -250,18 +251,12 @@ pub async fn card_command<S: SpiBus>(
                                     Phase::ReceiveStartBlockToken((Instant::now(), new_parts_read))
                             }
                         } else {
-                            defmt::error!(
-                                "Data: {:02X}. Received CRC: 0x{:04X}. Expected CRC: 0x{:04X}.",
-                                data,
-                                crc,
-                                expected_crc
-                            );
                             return Err(CardCommand3Error::InvalidCrc);
                         }
                     } else {
                         let byte_0 = bytes_to_process[0];
                         bytes_processed += 1;
-                        phase = Phase::ReceiveCrc((parts_read, Some(byte_0)));
+                        phase = Phase::ReceiveCrc((expected_crc, parts_read, Some(byte_0)));
                     };
                 }
                 Phase::WriteData(_) => todo!(),
@@ -270,8 +265,9 @@ pub async fn card_command<S: SpiBus>(
         defmt::trace!("procesing time: {} us", before.elapsed().as_micros());
 
         // Set up buffer
-        let bytes_to_transfer = match phase {
+        let bytes_to_transfer = match &phase {
             Phase::SendCommand(bytes_sent) => {
+                let bytes_sent = *bytes_sent;
                 let copy_len = min(size_of::<Command>() - bytes_sent, buffer.len());
                 buffer[..copy_len].copy_from_slice(&command[bytes_sent..bytes_sent + copy_len]);
                 let bytes_to_transfer = (copy_len
@@ -344,7 +340,7 @@ pub async fn card_command<S: SpiBus>(
                 buffer[..bytes_to_transfer].fill(0xFF);
                 bytes_to_transfer
             }
-            Phase::ReceiveData((parts_read, bytes_received)) => {
+            Phase::ReceiveData((_digest, parts_read, bytes_received)) => {
                 let bytes_to_transfer = (if let Some(CardCommandOperation::Read(op)) = &operation {
                     op.buffer.len() - bytes_received
                         + size_of::<u16>()
@@ -357,7 +353,7 @@ pub async fn card_command<S: SpiBus>(
                 buffer[..bytes_to_transfer].fill(0xFF);
                 bytes_to_transfer
             }
-            Phase::ReceiveCrc((parts_read, byte_0)) => {
+            Phase::ReceiveCrc((_expected_crc, parts_read, byte_0)) => {
                 let bytes_to_transfer = (if let Some(CardCommandOperation::Read(op)) = &operation {
                     size_of::<u16>() - if byte_0.is_some() { 1 } else { 0 }
                         + (op.expected_bytes_until_data + op.buffer.len() + size_of::<u16>())
