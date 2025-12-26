@@ -9,6 +9,7 @@ use defmt::warn;
 #[cfg(feature = "esp32c3")]
 pub use dma::*;
 mod shared_spi_bus;
+use embassy_embedded_hal::SetConfig;
 pub use shared_spi_bus::*;
 mod disk;
 
@@ -103,6 +104,11 @@ const COMMAND_TIMEOUT: Duration = Duration::from_millis(100);
 /// This is just a guess
 const BYTES_UNTIL_CSD: usize = 2;
 const CSD_TIMEOUT: Duration = Duration::from_millis(100);
+/// In my experience this is up to 2
+/// Note that if we make this super big it will reduce performance
+/// With `670` we are basically guaranteeing that the transfer speed will be <0.5x of the SPI transfer speed
+const BYTES_UNTIL_READ_DATA: usize = 670;
+const READ_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// The buffer can have any data
 pub async fn card_command_2<S: SpiBus>(
@@ -643,10 +649,16 @@ pub async fn demo_command_18<Bus: SpiBus, Cs: OutputPin>(
     result
 }
 
-pub struct SpiSdCard<Spi, Cs, Delayer> {
+pub struct SpiSdCard<Spi, Cs, Delayer>
+where
+    Spi: SharedSpiBus<u8>,
+    Spi::Bus: SetConfig,
+{
     spi: Spi,
     cs: Cs,
     delayer: Delayer,
+    _400_khz_config: <Spi::Bus as SetConfig>::Config,
+    _25_mhz_config: <Spi::Bus as SetConfig>::Config,
 }
 
 struct CommandResponse<'a> {
@@ -728,37 +740,6 @@ enum CardCommandOperation<'a> {
     Write(WriteOperation<'a>),
 }
 
-const fn command_buffer_len(
-    expected_bytes_until_response: usize,
-    response: &mut [u8],
-    operation: Option<CardCommandOperation<'_>>,
-) -> usize {
-    let mut len = 0;
-    len += size_of::<Command>();
-    len += expected_bytes_until_response;
-    len += response.len();
-    match operation {
-        None => {}
-        Some(CardCommandOperation::Read(ReadOperation {
-            buffer,
-            expected_bytes_until_data,
-            timeout,
-        })) => {
-            len += expected_bytes_until_data;
-            len += buffer.len();
-        }
-        Some(CardCommandOperation::Write(WriteOperation {
-            buffer,
-            expected_bytes_until_data,
-            timeout,
-        })) => {
-            len += expected_bytes_until_data;
-            len += buffer.len();
-        }
-    };
-    len
-}
-
 #[derive(Debug)]
 enum CardCommand3Error<SpiError> {
     Spi(SpiError),
@@ -795,13 +776,13 @@ async fn card_command_3<S: SpiBus>(
     let mut phase = Phase::SendCommand(0);
     let mut buffer_valid_bytes = 0;
     'spi: loop {
-        defmt::info!("number of bytes to process: {}", buffer_valid_bytes);
+        defmt::trace!("number of bytes to process: {}", buffer_valid_bytes);
         let mut bytes_processed = 0;
         while buffer_valid_bytes > bytes_processed {
             let bytes_to_process = &mut buffer[bytes_processed..buffer_valid_bytes];
             match phase {
                 Phase::SendCommand(bytes_sent) => {
-                    defmt::info!("send command phase: {}", bytes_sent);
+                    defmt::trace!("send command phase: {}", bytes_sent);
                     let bytes_to_send = size_of::<Command>() - bytes_sent;
                     let command_bytes_sent = min(bytes_to_send, bytes_to_process.len());
                     bytes_processed += command_bytes_sent;
@@ -811,7 +792,7 @@ async fn card_command_3<S: SpiBus>(
                     } else {
                         phase = Phase::SendCommand(new_bytes_sent)
                     }
-                    defmt::info!(
+                    defmt::trace!(
                         "send command phase: {}. new bytes sent: {}",
                         bytes_sent,
                         new_bytes_sent
@@ -823,7 +804,7 @@ async fn card_command_3<S: SpiBus>(
                     let mut data_received = data_received;
                     let r1_index = loop {
                         if let Some(&byte) = bytes_to_process.get(i) {
-                            defmt::info!("Byte: 0x{:02X}", byte);
+                            defmt::trace!("Byte: 0x{:02X}", byte);
                             if byte != 0xFF {
                                 data_received = true;
                                 if !R1::from_bits_retain(byte).contains(R1::BIT_7) {
@@ -835,7 +816,7 @@ async fn card_command_3<S: SpiBus>(
                         }
                         i += 1;
                     };
-                    defmt::info!(
+                    defmt::trace!(
                         "receive response start phase: {}, {}. r1 index: {}",
                         start_time,
                         data_received,
@@ -854,7 +835,7 @@ async fn card_command_3<S: SpiBus>(
                 Phase::ReceiveResponse(bytes_received) => {
                     let bytes_to_receive = response.len() - bytes_received;
                     let copy_len = min(bytes_to_receive, bytes_to_process.len());
-                    defmt::info!(
+                    defmt::trace!(
                         "receive response phase: {}. processing bytes: {:02X}. copy len: {}",
                         bytes_received,
                         bytes_to_process,
@@ -879,23 +860,26 @@ async fn card_command_3<S: SpiBus>(
                     }
                 }
                 Phase::ReceiveStartBlockToken => {
-                    defmt::info!("receive start block token phase");
-                    // Scan for token
-                    if let Some((index, &byte)) = bytes_to_process
-                        .iter()
-                        .enumerate()
-                        .find(|(_, byte)| **byte != 0xFF)
-                    {
-                        if byte == START_BLOCK_TOKEN {
-                            bytes_processed += index + 1;
-                            phase = Phase::ReceiveData(0);
-                        } else {
-                            return Err(CardCommand3Error::ExpectedStartBlockToken);
+                    defmt::trace!("receive start block token phase");
+                    Timer::after_millis(10).await;
+                    for &mut byte in bytes_to_process {
+                        bytes_processed += 1;
+                        if byte != 0xFF {
+                            if byte == START_BLOCK_TOKEN {
+                                phase = Phase::ReceiveData(0);
+                                break;
+                            } else {
+                                defmt::error!(
+                                    "expected start block token, but got 0x{:02X} instead",
+                                    byte
+                                );
+                                return Err(CardCommand3Error::ExpectedStartBlockToken);
+                            }
                         }
                     }
                 }
                 Phase::ReceiveData(bytes_received) => {
-                    defmt::info!("receive data phase: {}", bytes_received);
+                    defmt::trace!("receive data phase: {}", bytes_received);
                     let operation =
                         if let Some(CardCommandOperation::Read(operation)) = &mut operation {
                             operation
@@ -912,10 +896,14 @@ async fn card_command_3<S: SpiBus>(
                         phase = Phase::ReceiveCrc(None);
                     } else {
                         phase = Phase::ReceiveData(new_bytes_received);
+                        defmt::trace!(
+                            "did not receive all data in a single transfer (missing {} bytes)",
+                            operation.buffer.len() - new_bytes_received
+                        );
                     }
                 }
                 Phase::ReceiveCrc(byte_0) => {
-                    defmt::info!("receive CRC phase: {}", byte_0);
+                    defmt::trace!("receive CRC phase: {}", byte_0);
                     if let Some(byte_0) = byte_0 {
                         let byte_1 = bytes_to_process[0];
                         let crc = u16::from_be_bytes([byte_0, byte_1]);
@@ -1049,25 +1037,46 @@ async fn card_command_3<S: SpiBus>(
             Phase::WriteData(_) => todo!(),
         };
         assert_ne!(bytes_to_transfer, 0);
+        defmt::trace!("transferring...");
+        let before = Instant::now();
         spi.transfer_in_place(&mut buffer[..bytes_to_transfer])
             .await
             .map_err(CardCommand3Error::Spi)?;
-        buffer_valid_bytes = bytes_to_transfer;
-        defmt::info!(
-            "Transferred {} bytes and read: {}",
-            buffer_valid_bytes,
-            &mut buffer[..buffer_valid_bytes]
+        defmt::trace!(
+            "Transferred {} bytes in {} us",
+            bytes_to_transfer,
+            before.elapsed().as_micros()
         );
+        defmt::trace!("Bytes: {:02X}", &mut buffer[..bytes_to_transfer]);
+        buffer_valid_bytes = bytes_to_transfer;
     }
     Ok(())
 }
 
-impl<Spi: SharedSpiBus<u8>, Cs: OutputPin, Delayer: DelayNs> SpiSdCard<Spi, Cs, Delayer> {
+impl<Spi: SharedSpiBus<u8>, Cs: OutputPin, Delayer: DelayNs> SpiSdCard<Spi, Cs, Delayer>
+where
+    Spi::Bus: SetConfig,
+{
     /// This assumes that the voltage you are providing to the SD card is 3.3V!
     /// If for some reason you are not providing 3.3V, create an issue
     /// so we can better check if the SD card is compatible with the voltage you are providing.
-    pub fn new(spi: Spi, cs: Cs, delayer: Delayer) -> Self {
-        Self { spi, cs, delayer }
+    ///
+    /// Before the SD card's initialization is complete, a 400 kHz SPI speed is used. After that, a 25 MHz SPI speed can be used.
+    /// Provide the correct SPI speeds.
+    pub fn new(
+        spi: Spi,
+        cs: Cs,
+        delayer: Delayer,
+        _400_khz_config: <Spi::Bus as SetConfig>::Config,
+        _25_mhz_config: <Spi::Bus as SetConfig>::Config,
+    ) -> Self {
+        Self {
+            spi,
+            cs,
+            delayer,
+            _400_khz_config,
+            _25_mhz_config,
+        }
     }
 
     pub async fn init_card(
@@ -1078,12 +1087,17 @@ impl<Spi: SharedSpiBus<u8>, Cs: OutputPin, Delayer: DelayNs> SpiSdCard<Spi, Cs, 
         self.delayer.delay_ms(1).await;
 
         let mut spi = self.spi.lock().await;
+        spi.set_config(&self._400_khz_config);
 
         // Send 0xFF for at least 74 clock cycles according to the spec
         // So 9 bytes
         spi.write(&[0xFF; 9]).await.unwrap();
 
         self.cs.set_low().map_err(Error::CsPin)?;
+
+        // This might help if the card was previously in the middle of something
+        // TODO: Is this needed?
+        spi.write(&[0xFF; 1000]).await.unwrap();
 
         let mut got_response = false;
         // TODO: Gracefully handle failures (remember to set CS to high and write a 0xFF byte);
@@ -1379,18 +1393,98 @@ impl<Spi: SharedSpiBus<u8>, Cs: OutputPin, Delayer: DelayNs> SpiSdCard<Spi, Cs, 
     }
 }
 
-pub struct SdCardDisk<'a, Spi, Cs, Delayer> {
+pub struct SdCardDisk<'a, Spi, Cs, Delayer>
+where
+    Spi: SharedSpiBus<u8>,
+    Spi::Bus: SetConfig,
+{
     sd_card: &'a mut SpiSdCard<Spi, Cs, Delayer>,
 }
 
-impl<Spi: SharedSpiBus<u8>, Cs: OutputPin, Delayer: DelayNs> Disk
-    for SdCardDisk<'_, Spi, Cs, Delayer>
+impl<Spi, Cs: OutputPin, Delayer: DelayNs> Disk for SdCardDisk<'_, Spi, Cs, Delayer>
+where
+    Spi: SharedSpiBus<u8>,
+    Spi::Bus: SetConfig,
 {
     type Address = u64;
     type Error = Error<<Spi::Bus as ErrorType>::Error, Cs::Error>;
 
     async fn read(&mut self, start: Self::Address, buffer: &mut [u8]) -> Result<(), Self::Error> {
-        todo!()
+        assert_eq!(buffer.len(), 512);
+        let mut spi = self.sd_card.spi.lock().await;
+        spi.set_config(&self.sd_card._25_mhz_config);
+
+        self.sd_card.cs.set_low().map_err(Error::CsPin)?;
+
+        let start_block = u32::try_from(start / 512).unwrap();
+        let end_block = u32::try_from((start + buffer.len() as u64).div_ceil(512)).unwrap();
+
+        for block_address in start_block..end_block {
+            let mut spi_buffer = [Default::default();
+                size_of::<Command>()
+                    + COMMAND_BYTES_UNTIL_RESPONSE
+                    + size_of::<R1>()
+                    + BYTES_UNTIL_READ_DATA
+                    + 512];
+            let mut response = [Default::default(); size_of::<R1>()];
+            // let mut block_bytes = [Default::default(); 512];
+            card_command_3(
+                spi.deref_mut(),
+                &mut spi_buffer,
+                &format_command(17, block_address),
+                COMMAND_BYTES_UNTIL_RESPONSE,
+                &mut response,
+                COMMAND_TIMEOUT,
+                Some(CardCommandOperation::Read(ReadOperation {
+                    buffer: buffer,
+                    expected_bytes_until_data: BYTES_UNTIL_READ_DATA,
+                    timeout: READ_TIMEOUT,
+                })),
+            )
+            .await
+            .map_err(|e| match e {
+                CardCommand3Error::Spi(e) => Error::SpiBus(e),
+                CardCommand3Error::ReceiveResponseTimeout(command_got_response) => {
+                    if command_got_response {
+                        Error::InitFailed
+                    } else {
+                        Error::NoResponse
+                    }
+                }
+                CardCommand3Error::ExpectedStartBlockToken => Error::InitFailed,
+                CardCommand3Error::InvalidCrc => Error::InitFailed,
+            })?;
+            let r1 = R1::from_bits_retain(response[0]);
+            if !r1.is_empty() {
+                return Err(Error::InitFailed);
+            }
+
+            // defmt::trace!("read block: {:02X}", block_bytes);
+
+            // if block_address == start_block {
+            //     let start_offset = start as usize % 512;
+            //     let copy_len = min(512 - start_offset, buffer.len());
+            //     defmt::trace!("copying {} bytes", copy_len);
+            //     buffer[..copy_len]
+            //         .copy_from_slice(&block_bytes[start_offset..start_offset + copy_len]);
+            // } else if block_address == end_block {
+            //     let buffer_start = ((block_address - start_block) * 512) as usize;
+            //     let copy_len = min((start as usize + buffer.len()) % 512, buffer.len());
+            //     defmt::trace!("copying {} bytes", copy_len);
+            //     buffer[buffer_start..].copy_from_slice(&block_bytes[..copy_len]);
+            // } else {
+            //     let buffer_start = ((block_address - start_block) * 512) as usize;
+            //     defmt::trace!("copying 512 bytes");
+            //     buffer[buffer_start..buffer_start + 512].copy_from_slice(&block_bytes)
+            // }
+        }
+
+        spi.flush().await.map_err(Error::SpiBus)?;
+        self.sd_card.cs.set_high().map_err(Error::CsPin)?;
+        spi.write(&[0xFF]).await.map_err(Error::SpiBus)?;
+        spi.flush().await.map_err(Error::SpiBus)?;
+
+        Ok(())
     }
 
     async fn write(&mut self, start: Self::Address, buffer: &[u8]) -> Result<(), Self::Error> {
@@ -1398,12 +1492,17 @@ impl<Spi: SharedSpiBus<u8>, Cs: OutputPin, Delayer: DelayNs> Disk
     }
 }
 
-impl<Spi: SharedSpiBus<u8>, Cs: OutputPin, Delayer: DelayNs> SdCardDisk<'_, Spi, Cs, Delayer> {
+impl<Spi, Cs: OutputPin, Delayer: DelayNs> SdCardDisk<'_, Spi, Cs, Delayer>
+where
+    Spi: SharedSpiBus<u8>,
+    Spi::Bus: SetConfig,
+{
     /// Returns the card capacity in bytes
     pub async fn capacity(
         &mut self,
     ) -> Result<u64, Error<<Spi::Bus as ErrorType>::Error, Cs::Error>> {
         let mut spi = self.sd_card.spi.lock().await;
+        spi.set_config(&self.sd_card._25_mhz_config);
 
         self.sd_card.cs.set_low().map_err(Error::CsPin)?;
 
