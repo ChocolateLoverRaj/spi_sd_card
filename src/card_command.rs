@@ -230,8 +230,13 @@ pub async fn card_command<S: SpiBus>(
                         } else {
                             // don't skip anything
                             let start = start - operation.skip_bytes;
-                            (start, 0, read_len)
+                            if start < operation.buffer.len() {
+                                (start, 0, read_len)
+                            } else {
+                                (0, 0, 0)
+                            }
                         };
+                        defmt::trace!("copy_len: {}", copy_len);
                         // check for end
                         let copy_len = if dest_start + copy_len > operation.buffer.len() {
                             let skip_end = dest_start + copy_len - operation.buffer.len();
@@ -239,8 +244,19 @@ pub async fn card_command<S: SpiBus>(
                         } else {
                             copy_len
                         };
-                        operation.buffer[dest_start..dest_start + copy_len]
-                            .copy_from_slice(&bytes_to_read[src_start..src_start + copy_len]);
+                        defmt::trace!(
+                            "start: {}. dest_start: {}. src_start: {}. copy_len: {}. parts_read: {}. bytes_received: {}. read_len: {}",
+                            start,
+                            dest_start,
+                            src_start,
+                            copy_len,
+                            parts_read,
+                            bytes_received,
+                            read_len
+                        );
+                        let dest = &mut operation.buffer[dest_start..dest_start + copy_len];
+                        let src = &bytes_to_read[src_start..src_start + copy_len];
+                        dest.copy_from_slice(src);
                     }
                     digest.update(&bytes_to_read);
                     bytes_processed += read_len;

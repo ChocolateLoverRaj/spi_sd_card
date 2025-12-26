@@ -540,7 +540,7 @@ where
                     + size_of::<u16>()];
             let mut response = [Default::default(); size_of::<R1>()];
             let end_block = u32::try_from((start + buffer.len() as u64).div_ceil(512)).unwrap();
-            for (i, block_address) in (start_block..end_block).into_iter().enumerate() {
+            for block_address in start_block..end_block {
                 defmt::info!("Reading single block at 0x{:X}", block_address * 512);
                 card_command(
                     spi.deref_mut(),
@@ -605,7 +605,7 @@ where
         // }
 
         spi.flush().await.map_err(Error::SpiBus)?;
-        defmt::info!(
+        defmt::trace!(
             "[spi_sd_card] read {} B / {} us @ {:X}",
             buffer.len(),
             before.elapsed().as_micros(),
