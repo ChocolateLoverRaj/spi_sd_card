@@ -42,7 +42,7 @@ pub enum CardCommand3Error<SpiError> {
 }
 
 /// Supports all commands except for multi block read and write.
-pub async fn card_command_3<S: SpiBus>(
+pub async fn card_command<S: SpiBus>(
     spi: &mut S,
     buffer: &mut [u8],
     command: &[u8; 6],
