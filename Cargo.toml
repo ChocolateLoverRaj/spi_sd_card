@@ -19,7 +19,7 @@ num-traits = { version = "0.2.19", optional = true, default-features = false }
 
 [features]
 default = []
-defmt = ["dep:defmt", "esp-hal/defmt"]
+defmt = ["dep:defmt", "esp-hal/defmt", "embassy-time/defmt"]
 chrono = ["dep:chrono", "dep:num-traits"]
 esp32c3 = ["dep:esp-hal", "esp-hal/esp32c3"]
 embassy-sync = ["dep:embassy-sync"]

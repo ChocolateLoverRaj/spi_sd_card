@@ -13,6 +13,7 @@ pub struct ReadOperation<'a> {
     /// Lets you read multiple, so buffer will be N * 512 bytes and parts will be N
     pub parts: usize,
     pub part_size: usize,
+    pub crc_enabled: bool,
 }
 
 pub struct WriteOperation<'a> {
@@ -24,6 +25,8 @@ pub struct WriteOperation<'a> {
 pub enum CardCommandOperation<'a> {
     Read(ReadOperation<'a>),
     Write(WriteOperation<'a>),
+    /// Expected bytes until not busy
+    BusySignal(usize),
 }
 
 #[derive(Debug)]
@@ -34,6 +37,8 @@ pub enum CardCommand3Error<SpiError> {
     /// Expected a start block token, but got something else
     ExpectedStartBlockToken,
     InvalidCrc,
+    /// Returns the number of data successfully read before the timeout
+    ReceiveDataTimeout(usize),
 }
 
 /// Supports all commands except for multi block read and write.
@@ -46,14 +51,18 @@ pub async fn card_command_3<S: SpiBus>(
     response_timeout: Duration,
     mut operation: Option<CardCommandOperation<'_>>,
 ) -> Result<(), CardCommand3Error<S::Error>> {
+    #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+    #[derive(Debug)]
     enum Phase {
         /// Bytes sent
         SendCommand(usize),
         ReceiveResponseStart((Instant, bool)),
         /// Number of bytes of the response received so far
         ReceiveResponse(usize),
+        /// Records number of busy bytes
+        WaitUntilNotBusy(usize),
         /// Data: parts read
-        ReceiveStartBlockToken(usize),
+        ReceiveStartBlockToken((Instant, usize)),
         /// Number of parts, number of bytes of the data received so far
         ReceiveData((usize, usize)),
         /// Number of parts read, The byte of the partial CRC received, if any
@@ -67,6 +76,7 @@ pub async fn card_command_3<S: SpiBus>(
         let mut bytes_processed = 0;
         let before = Instant::now();
         while buffer_valid_bytes > bytes_processed {
+            defmt::trace!("processing: {:?}", phase);
             let bytes_to_process = &mut buffer[bytes_processed..buffer_valid_bytes];
             match phase {
                 Phase::SendCommand(bytes_sent) => {
@@ -137,17 +147,31 @@ pub async fn card_command_3<S: SpiBus>(
                         match &operation {
                             None => break 'spi,
                             Some(CardCommandOperation::Read(_)) => {
-                                phase = Phase::ReceiveStartBlockToken(0);
+                                phase = Phase::ReceiveStartBlockToken((Instant::now(), 0));
                             }
                             Some(CardCommandOperation::Write(_)) => {
                                 phase = Phase::WriteData(0);
+                            }
+                            Some(CardCommandOperation::BusySignal(_)) => {
+                                phase = Phase::WaitUntilNotBusy(0)
                             }
                         }
                     } else {
                         phase = Phase::ReceiveResponse(new_bytes_received);
                     }
                 }
-                Phase::ReceiveStartBlockToken(parts_read) => {
+                Phase::WaitUntilNotBusy(busy_bytes) => {
+                    let mut i = 0;
+                    while let Some(&byte) = bytes_to_process.get(i) {
+                        if byte != 0 {
+                            defmt::trace!("{} bytes until not busy", busy_bytes + i);
+                            break 'spi;
+                        }
+                        i += 1;
+                    }
+                    phase = Phase::WaitUntilNotBusy(i);
+                }
+                Phase::ReceiveStartBlockToken((start_time, parts_read)) => {
                     defmt::trace!("receive start block token phase");
                     for &mut byte in bytes_to_process {
                         bytes_processed += 1;
@@ -163,6 +187,15 @@ pub async fn card_command_3<S: SpiBus>(
                                 return Err(CardCommand3Error::ExpectedStartBlockToken);
                             }
                         }
+                    }
+                    let operation =
+                        if let Some(CardCommandOperation::Read(operation)) = &mut operation {
+                            operation
+                        } else {
+                            unreachable!()
+                        };
+                    if start_time.elapsed() > operation.timeout {
+                        return Err(CardCommand3Error::ReceiveDataTimeout(parts_read));
                     }
                 }
                 Phase::ReceiveData((parts_read, bytes_received)) => {
@@ -208,12 +241,13 @@ pub async fn card_command_3<S: SpiBus>(
                             [buffer_position..buffer_position + operation.part_size];
                         let expected_crc = Crc::<u16>::new(&CRC_16_XMODEM).checksum(data);
 
-                        if crc == expected_crc {
+                        if crc == expected_crc || !operation.crc_enabled {
                             let new_parts_read = parts_read + 1;
                             if new_parts_read == operation.parts {
                                 break 'spi;
                             } else {
-                                phase = Phase::ReceiveStartBlockToken(new_parts_read)
+                                phase =
+                                    Phase::ReceiveStartBlockToken((Instant::now(), new_parts_read))
                             }
                         } else {
                             defmt::error!(
@@ -249,12 +283,11 @@ pub async fn card_command_3<S: SpiBus>(
                             (op.expected_bytes_until_data + op.buffer.len() + size_of::<u16>())
                                 * op.parts
                         }
-                        Some(CardCommandOperation::Write(WriteOperation {
-                            buffer,
-                            expected_bytes_until_data,
-                            timeout,
-                        })) => {
+                        Some(CardCommandOperation::Write(_)) => {
                             todo!()
+                        }
+                        Some(CardCommandOperation::BusySignal(expected_bytes_until_not_busy)) => {
+                            *expected_bytes_until_not_busy
                         }
                     })
                 .min(buffer.len());
@@ -270,12 +303,11 @@ pub async fn card_command_3<S: SpiBus>(
                             (op.expected_bytes_until_data + op.buffer.len() + size_of::<u16>())
                                 * op.parts
                         }
-                        Some(CardCommandOperation::Write(WriteOperation {
-                            buffer,
-                            expected_bytes_until_data,
-                            timeout,
-                        })) => {
+                        Some(CardCommandOperation::Write(_)) => {
                             todo!()
+                        }
+                        Some(CardCommandOperation::BusySignal(expected_bytes_until_not_busy)) => {
+                            *expected_bytes_until_not_busy
                         }
                     })
                 .min(buffer.len());
@@ -290,19 +322,18 @@ pub async fn card_command_3<S: SpiBus>(
                             (op.expected_bytes_until_data + op.buffer.len() + size_of::<u16>())
                                 * op.parts
                         }
-                        Some(CardCommandOperation::Write(WriteOperation {
-                            buffer,
-                            expected_bytes_until_data,
-                            timeout,
-                        })) => {
+                        Some(CardCommandOperation::Write(_)) => {
                             todo!()
+                        }
+                        Some(CardCommandOperation::BusySignal(expected_bytes_until_not_busy)) => {
+                            *expected_bytes_until_not_busy
                         }
                     })
                 .min(buffer.len());
                 buffer[..bytes_to_transfer].fill(0xFF);
                 bytes_to_transfer
             }
-            Phase::ReceiveStartBlockToken(parts_read) => {
+            Phase::ReceiveStartBlockToken((_, parts_read)) => {
                 let bytes_to_transfer = (if let Some(CardCommandOperation::Read(op)) = &operation {
                     (op.expected_bytes_until_data + op.buffer.len() + size_of::<u16>())
                         * (op.parts - parts_read)
@@ -338,9 +369,22 @@ pub async fn card_command_3<S: SpiBus>(
                 buffer[..bytes_to_transfer].fill(0xFF);
                 bytes_to_transfer
             }
+            Phase::WaitUntilNotBusy(_) => {
+                let bytes_to_transfer =
+                    (if let Some(CardCommandOperation::BusySignal(expected_bytes_until_not_busy)) =
+                        &operation
+                    {
+                        *expected_bytes_until_not_busy
+                    } else {
+                        unreachable!()
+                    })
+                    .min(buffer.len());
+                buffer[..bytes_to_transfer].fill(0xFF);
+                bytes_to_transfer
+            }
             Phase::WriteData(_) => todo!(),
         };
-        assert_ne!(bytes_to_transfer, 0);
+        assert_ne!(bytes_to_transfer, 0, "{:#?}", phase);
         defmt::trace!("transferring...");
         let before = Instant::now();
         spi.transfer_in_place(&mut buffer[..bytes_to_transfer])
