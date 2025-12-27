@@ -4,6 +4,9 @@
 pub trait Disk {
     type Address;
     type Error;
+    /// Underlying reads and writes will use this block size.
+    /// It is more efficient to read entire blocks at a time instead of reading sections of data within a block multiple times.
+    const BLOCK_SIZE: usize;
 
     // fn len(&self) -> Self::Address;
     async fn read(&mut self, start: Self::Address, buffer: &mut [u8]) -> Result<(), Self::Error>;

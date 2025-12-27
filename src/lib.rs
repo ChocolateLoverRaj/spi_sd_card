@@ -454,6 +454,8 @@ where
     pub enable_read_multiple: bool,
 }
 
+pub const BLOCK_SIZE: usize = 512;
+
 impl<Spi, Cs: OutputPin, Delayer: DelayNs> Disk for SdCardDisk<'_, Spi, Cs, Delayer>
 where
     Spi: SharedSpiBus<u8>,
@@ -462,6 +464,7 @@ where
 {
     type Address = u64;
     type Error = Error<Spi::Bus, Cs::Error>;
+    const BLOCK_SIZE: usize = BLOCK_SIZE;
 
     async fn read(&mut self, start: Self::Address, buffer: &mut [u8]) -> Result<(), Self::Error> {
         let mut spi = self.sd_card.spi.lock().await;
