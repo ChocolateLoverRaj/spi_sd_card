@@ -544,7 +544,7 @@ where
             let mut response = [Default::default(); size_of::<R1>()];
             let end_block = u32::try_from((start + buffer.len() as u64).div_ceil(512)).unwrap();
             for block_address in start_block..end_block {
-                defmt::info!("Reading single block at 0x{:X}", block_address * 512);
+                defmt::trace!("Reading single block at 0x{:X}", block_address * 512);
                 card_command(
                     spi.deref_mut(),
                     &mut spi_buffer,
