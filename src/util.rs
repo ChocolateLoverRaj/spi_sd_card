@@ -1,8 +1,5 @@
 use embedded_hal_async::spi::SpiBus;
 
-/// We want to do as much as possible within the limits of an underlying buffer
-pub fn magic<S: SpiBus>(spi_bus: &mut S) {}
-
 pub struct CommandSender<'a, S> {
     spi_bus: &'a mut S,
     buffer: &'a mut [u8],

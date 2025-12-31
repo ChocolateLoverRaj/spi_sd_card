@@ -221,3 +221,5 @@ impl Mdt {
 }
 
 pub const START_BLOCK_TOKEN: u8 = 0b1111_1110;
+
+pub type Command = [u8; 6];
