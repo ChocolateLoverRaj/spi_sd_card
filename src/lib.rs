@@ -84,6 +84,10 @@ where
     // Send status errors
     SendStatusResponseTimeout,
     SendStatusResponseError,
+
+    // set_card_detect_enable errors
+    Acmd42ResponseTimeout,
+    Acmd42ResponseError,
 }
 
 /// This is now many bytes between the end of a command and the start of a response (R1) we expect.

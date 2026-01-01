@@ -152,6 +152,13 @@ bitflags! {
     }
 }
 
+bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+    pub struct CommandA42Argument: u32 {
+        const SET_CLR_CARD_DETECT = 1 << 0;
+    }
+}
+
 bitfield! {
     pub struct DataResponseToken(u8);
 

@@ -274,4 +274,79 @@ where
 
         Ok(status)
     }
+
+    pub async fn set_card_detect_enable(
+        &mut self,
+        enable: bool,
+    ) -> Result<(), Error<Spi::Bus, Cs::Error>> {
+        let mut spi = self.sd_card.spi.lock().await;
+        spi.set_config(&self.sd_card._25_mhz_config)
+            .map_err(Error::SpiSetConfig)?;
+
+        self.sd_card.cs.set_low().map_err(Error::CsPin)?;
+
+        {
+            let mut buffer = [Default::default();
+                size_of::<Command>() + EXPECTED_BYTES_UNTIL_RESPONSE + size_of::<R1>()];
+            let mut response = [Default::default(); size_of::<R1>()];
+            card_command(
+                spi.deref_mut(),
+                &mut buffer,
+                &format_command(55, 0),
+                EXPECTED_BYTES_UNTIL_RESPONSE,
+                &mut response,
+                COMMAND_TIMEOUT,
+                None,
+            )
+            .await
+            .map_err(|e| match e {
+                CardCommand3Error::Spi(e) => Error::SpiBus(e),
+                CardCommand3Error::ReceiveResponseTimeout(_) => Error::Cmd55Failed,
+                _ => unreachable!(),
+            })?;
+            let r1 = R1::from_bits_retain(response[0]);
+            if !r1.is_empty() {
+                return Err(Error::Cmd55Failed);
+            }
+        }
+        {
+            let mut buffer = [Default::default();
+                size_of::<Command>() + EXPECTED_BYTES_UNTIL_RESPONSE + size_of::<R1>()];
+            let mut response = [Default::default(); size_of::<R1>()];
+            card_command(
+                spi.deref_mut(),
+                &mut buffer,
+                &format_command(42, {
+                    let mut argument = CommandA42Argument::empty();
+                    argument.set(CommandA42Argument::SET_CLR_CARD_DETECT, enable);
+                    argument.bits()
+                }),
+                EXPECTED_BYTES_UNTIL_RESPONSE,
+                &mut response,
+                COMMAND_TIMEOUT,
+                None,
+            )
+            .await
+            .map_err(|e| match e {
+                CardCommand3Error::Spi(e) => Error::SpiBus(e),
+                CardCommand3Error::ReceiveResponseTimeout(_) => Error::Acmd42ResponseError,
+                _ => unreachable!(),
+            })?;
+            let r1 = R1::from_bits_retain(response[0]);
+            if !r1.is_empty() {
+                return Err(Error::Acmd42ResponseError);
+            }
+        }
+
+        spi.flush().await.map_err(Error::SpiBus)?;
+        self.sd_card.cs.set_high().map_err(Error::CsPin)?;
+        spi.write(&[0xFF]).await.map_err(Error::SpiBus)?;
+        spi.flush().await.map_err(Error::SpiBus)?;
+
+        Ok(())
+    }
+
+    pub fn cs_mut(&mut self) -> &mut Cs {
+        &mut self.sd_card.cs
+    }
 }
