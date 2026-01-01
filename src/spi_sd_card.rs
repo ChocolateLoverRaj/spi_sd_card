@@ -274,7 +274,7 @@ where
             }
         }
 
-        defmt::info!("Reading OCR again");
+        defmt::trace!("Reading OCR again");
 
         // Get OCR
         let ocr = {
@@ -308,7 +308,7 @@ where
         spi.write(&[0xFF]).await.map_err(Error::SpiBus)?;
         spi.flush().await.map_err(Error::SpiBus)?;
 
-        defmt::info!("is SDHC or SDXC?: {}", ocr.supports_sdhc_or_sdxc().unwrap());
+        defmt::trace!("is SDHC or SDXC?: {}", ocr.supports_sdhc_or_sdxc().unwrap());
 
         Ok(SdCardDisk {
             sd_card: self,
