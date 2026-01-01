@@ -75,6 +75,13 @@ pub struct R7 {
     pub check_pattern: u8,
 }
 
+#[derive(Debug)]
+#[repr(C)]
+pub struct R2 {
+    pub byte_0: R1,
+    pub byte_1: R2Byte1,
+}
+
 bitfield! {
     pub struct Command8Argument(u32);
 

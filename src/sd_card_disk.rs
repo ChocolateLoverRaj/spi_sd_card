@@ -233,4 +233,45 @@ where
 
         Ok(csd.card_capacity_bytes())
     }
+
+    pub async fn get_status(&mut self) -> Result<R2Byte1, Error<Spi::Bus, Cs::Error>> {
+        let mut spi = self.sd_card.spi.lock().await;
+        spi.set_config(&self.sd_card._25_mhz_config)
+            .map_err(Error::SpiSetConfig)?;
+
+        self.sd_card.cs.set_low().map_err(Error::CsPin)?;
+
+        let status = {
+            let mut buffer = [Default::default();
+                size_of::<Command>() + EXPECTED_BYTES_UNTIL_RESPONSE + size_of::<R2>()];
+            let mut response = [Default::default(); size_of::<R2>()];
+            card_command(
+                spi.deref_mut(),
+                &mut buffer,
+                &format_command(13, 0),
+                EXPECTED_BYTES_UNTIL_RESPONSE,
+                &mut response,
+                COMMAND_TIMEOUT,
+                None,
+            )
+            .await
+            .map_err(|e| match e {
+                CardCommand3Error::Spi(e) => Error::SpiBus(e),
+                CardCommand3Error::ReceiveResponseTimeout(_) => Error::SendStatusResponseTimeout,
+                _ => unreachable!(),
+            })?;
+            let r1 = R1::from_bits_retain(response[0]);
+            if !r1.is_empty() {
+                return Err(Error::SendStatusResponseError);
+            }
+            R2Byte1::from_bits_retain(response[1])
+        };
+
+        spi.flush().await.map_err(Error::SpiBus)?;
+        self.sd_card.cs.set_high().map_err(Error::CsPin)?;
+        spi.write(&[0xFF]).await.map_err(Error::SpiBus)?;
+        spi.flush().await.map_err(Error::SpiBus)?;
+
+        Ok(status)
+    }
 }

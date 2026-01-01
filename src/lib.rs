@@ -80,6 +80,10 @@ where
     SendCsdDataTimeout,
     SendCsdUnexpectedData,
     SendCsdInvalidCrc,
+
+    // Send status errors
+    SendStatusResponseTimeout,
+    SendStatusResponseError,
 }
 
 /// This is now many bytes between the end of a command and the start of a response (R1) we expect.
