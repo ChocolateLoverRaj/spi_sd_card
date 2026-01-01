@@ -346,7 +346,41 @@ where
         Ok(())
     }
 
-    pub fn cs_mut(&mut self) -> &mut Cs {
-        &mut self.sd_card.cs
+    pub async fn test(&mut self) -> Result<(), Error<Spi::Bus, Cs::Error>> {
+        let mut spi = self.sd_card.spi.lock().await;
+        spi.set_config(&self.sd_card._25_mhz_config)
+            .map_err(Error::SpiSetConfig)?;
+
+        self.sd_card.cs.set_low().map_err(Error::CsPin)?;
+
+        for i in 0..4 {
+            let cutoff_len = size_of::<Command>();
+
+            let mut buffer =
+                [0xFF; size_of::<Command>() + EXPECTED_BYTES_UNTIL_RESPONSE + size_of::<R2>()];
+            buffer[..6].copy_from_slice(&format_command(13, 0));
+            let buffer_to_transfer = &mut buffer[..cutoff_len];
+            spi.transfer_in_place(buffer_to_transfer).await.unwrap();
+            defmt::info!("bytes: {:02X}", buffer_to_transfer);
+
+            spi.flush().await.map_err(Error::SpiBus)?;
+            self.sd_card.cs.set_high().map_err(Error::CsPin)?;
+            let mut dummy_buffer = [0xFF];
+            spi.write(&mut dummy_buffer).await.map_err(Error::SpiBus)?;
+            spi.flush().await.map_err(Error::SpiBus)?;
+            defmt::info!("dummy buffer: {:02X}", dummy_buffer);
+            self.sd_card.cs.set_low().map_err(Error::CsPin)?;
+
+            let buffer_to_transfer = &mut buffer[cutoff_len..];
+            spi.transfer_in_place(buffer_to_transfer).await.unwrap();
+            defmt::info!("bytes: {:02X}", buffer_to_transfer);
+        }
+
+        spi.flush().await.map_err(Error::SpiBus)?;
+        self.sd_card.cs.set_high().map_err(Error::CsPin)?;
+        spi.write(&[0xFF]).await.map_err(Error::SpiBus)?;
+        spi.flush().await.map_err(Error::SpiBus)?;
+
+        Ok(())
     }
 }
