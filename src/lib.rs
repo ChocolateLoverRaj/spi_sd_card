@@ -14,7 +14,6 @@ mod util;
 use core::{fmt::Debug, ops::DerefMut};
 
 use card_command::*;
-use defmt::warn;
 pub use disk::*;
 use embassy_embedded_hal::SetConfig;
 use embassy_time::Duration;

@@ -40,14 +40,12 @@ where
 
         let start_block = u32::try_from(start / 512).unwrap();
 
-        let before = Instant::now();
         if buffer.len() > 512 && self.enable_read_multiple {
             // for block_address in start_block..end_block {
             // The bigger this is, the better
             // from my testing, 1024 can achieve super fast speeds and there is no need for larger than that
             let mut spi_buffer = [Default::default(); 1024];
             let mut response = [Default::default(); size_of::<R1>()];
-            // let mut block_bytes = [Default::default(); 512];
             card_command(
                 spi.deref_mut(),
                 &mut spi_buffer,
@@ -109,7 +107,6 @@ where
             let mut response = [Default::default(); size_of::<R1>()];
             let end_block = u32::try_from((start + buffer.len() as u64).div_ceil(512)).unwrap();
             for block_address in start_block..end_block {
-                defmt::trace!("Reading single block at 0x{:X}", block_address * 512);
                 card_command(
                     spi.deref_mut(),
                     &mut spi_buffer,
@@ -153,12 +150,6 @@ where
         }
 
         spi.flush().await.map_err(Error::SpiBus)?;
-        defmt::trace!(
-            "[spi_sd_card] read {} B / {} us @ {:X}",
-            buffer.len(),
-            before.elapsed().as_micros(),
-            start
-        );
         self.sd_card.cs.set_high().map_err(Error::CsPin)?;
         spi.write(&[0xFF]).await.map_err(Error::SpiBus)?;
         spi.flush().await.map_err(Error::SpiBus)?;
@@ -353,7 +344,7 @@ where
 
         self.sd_card.cs.set_low().map_err(Error::CsPin)?;
 
-        for i in 0..4 {
+        for _ in 0..4 {
             let cutoff_len = size_of::<Command>();
 
             let mut buffer =
@@ -361,19 +352,16 @@ where
             buffer[..6].copy_from_slice(&format_command(13, 0));
             let buffer_to_transfer = &mut buffer[..cutoff_len];
             spi.transfer_in_place(buffer_to_transfer).await.unwrap();
-            defmt::info!("bytes: {:02X}", buffer_to_transfer);
 
             spi.flush().await.map_err(Error::SpiBus)?;
             self.sd_card.cs.set_high().map_err(Error::CsPin)?;
             let mut dummy_buffer = [0xFF];
             spi.write(&mut dummy_buffer).await.map_err(Error::SpiBus)?;
             spi.flush().await.map_err(Error::SpiBus)?;
-            defmt::info!("dummy buffer: {:02X}", dummy_buffer);
             self.sd_card.cs.set_low().map_err(Error::CsPin)?;
 
             let buffer_to_transfer = &mut buffer[cutoff_len..];
             spi.transfer_in_place(buffer_to_transfer).await.unwrap();
-            defmt::info!("bytes: {:02X}", buffer_to_transfer);
         }
 
         spi.flush().await.map_err(Error::SpiBus)?;

@@ -1,7 +1,16 @@
 [package]
 name = "spi_sd_card"
-version = "0.1.0"
+description = "A library for using SD cards through SPI"
+version = "1.0.0"
 edition = "2024"
+repository = "https://github.com/ChocolateLoverRaj/spi_sd_card"
+authors = ["Rajas Paranjpe"]
+license = "AGPL-3.0-or-later"
+categories = ["no-std", "embedded", "no-std::no-alloc", "hardware-support"]
+
+[lib]
+test = false
+bench = false
 
 [dependencies]
 bitfield = "0.19.4"
@@ -23,4 +32,4 @@ chrono = ["dep:chrono", "dep:num-traits"]
 embassy-sync = ["dep:embassy-sync"]
 
 [patch.crates-io]
-crc = { path = "../crc-rs" }
+crc = { git = "https://github.com/mrhooray/crc-rs" }

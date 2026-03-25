@@ -104,8 +104,6 @@ where
                     let r1 = R1::from_bits_retain(response[0]);
                     if r1 == R1::IN_IDLE_STATE {
                         break Ok(());
-                    } else {
-                        warn!("Got response: {:x}, trying again..", r1.bits());
                     }
                 }
                 // TODO: Release SPI lock?
@@ -274,10 +272,8 @@ where
             }
         }
 
-        defmt::trace!("Reading OCR again");
-
         // Get OCR
-        let ocr = {
+        let _ocr = {
             let mut buffer = [Default::default();
                 size_of::<Command>() + EXPECTED_BYTES_UNTIL_RESPONSE + size_of::<R3>()];
             let mut response = [Default::default(); size_of::<R3>()];
@@ -307,8 +303,6 @@ where
         self.cs.set_high().map_err(Error::CsPin)?;
         spi.write(&[0xFF]).await.map_err(Error::SpiBus)?;
         spi.flush().await.map_err(Error::SpiBus)?;
-
-        defmt::trace!("is SDHC or SDXC?: {}", ocr.supports_sdhc_or_sdxc().unwrap());
 
         Ok(SdCardDisk {
             sd_card: self,

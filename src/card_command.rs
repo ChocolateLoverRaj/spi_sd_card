@@ -56,7 +56,6 @@ pub async fn card_command<S: SpiBus>(
     response_timeout: Duration,
     mut operation: Option<CardCommandOperation<'_>>,
 ) -> Result<(), CardCommand3Error<S::Error>> {
-    defmt::trace!("Operations: {:#?}", operation);
     const CRC: Crc<u16> = Crc::<u16>::new(&CRC_16_XMODEM);
     #[cfg_attr(feature = "defmt", derive(defmt::Format))]
     #[derive(Debug)]
@@ -79,15 +78,11 @@ pub async fn card_command<S: SpiBus>(
     let mut phase = Phase::SendCommand(0);
     let mut buffer_valid_bytes = 0;
     'spi: loop {
-        defmt::trace!("number of bytes to process: {}", buffer_valid_bytes);
         let mut bytes_processed = 0;
-        let before = Instant::now();
         while buffer_valid_bytes > bytes_processed {
-            defmt::trace!("processing: {:?}", phase);
             let bytes_to_process = &mut buffer[bytes_processed..buffer_valid_bytes];
             match phase {
                 Phase::SendCommand(bytes_sent) => {
-                    defmt::trace!("send command phase: {}", bytes_sent);
                     let bytes_to_send = size_of::<Command>() - bytes_sent;
                     let command_bytes_sent = min(bytes_to_send, bytes_to_process.len());
                     bytes_processed += command_bytes_sent;
@@ -97,11 +92,6 @@ pub async fn card_command<S: SpiBus>(
                     } else {
                         phase = Phase::SendCommand(new_bytes_sent)
                     }
-                    defmt::trace!(
-                        "send command phase: {}. new bytes sent: {}",
-                        bytes_sent,
-                        new_bytes_sent
-                    );
                 }
                 Phase::ReceiveResponseStart((start_time, data_received)) => {
                     // Scan for R1
@@ -109,7 +99,6 @@ pub async fn card_command<S: SpiBus>(
                     let mut data_received = data_received;
                     let r1_index = loop {
                         if let Some(&byte) = bytes_to_process.get(i) {
-                            defmt::trace!("Byte: 0x{:02X}", byte);
                             if byte != 0xFF {
                                 data_received = true;
                                 if !R1::from_bits_retain(byte).contains(R1::BIT_7) {
@@ -121,12 +110,6 @@ pub async fn card_command<S: SpiBus>(
                         }
                         i += 1;
                     };
-                    defmt::trace!(
-                        "receive response start phase: {}, {}. r1 index: {}",
-                        start_time,
-                        data_received,
-                        r1_index
-                    );
                     if let Some(r1_index) = r1_index {
                         bytes_processed += r1_index;
                         phase = Phase::ReceiveResponse(0);
@@ -140,12 +123,6 @@ pub async fn card_command<S: SpiBus>(
                 Phase::ReceiveResponse(bytes_received) => {
                     let bytes_to_receive = response.len() - bytes_received;
                     let copy_len = min(bytes_to_receive, bytes_to_process.len());
-                    defmt::trace!(
-                        "receive response phase: {}. processing bytes: {:02X}. copy len: {}",
-                        bytes_received,
-                        bytes_to_process,
-                        copy_len
-                    );
                     response[bytes_received..bytes_received + copy_len]
                         .copy_from_slice(&bytes_to_process[..copy_len]);
                     bytes_processed += copy_len;
@@ -171,7 +148,6 @@ pub async fn card_command<S: SpiBus>(
                     let mut i = 0;
                     while let Some(&byte) = bytes_to_process.get(i) {
                         if byte != 0 {
-                            defmt::trace!("{} bytes until not busy", busy_bytes + i);
                             break 'spi;
                         }
                         i += 1;
@@ -179,7 +155,6 @@ pub async fn card_command<S: SpiBus>(
                     phase = Phase::WaitUntilNotBusy(i);
                 }
                 Phase::ReceiveStartBlockToken((start_time, parts_read)) => {
-                    defmt::trace!("receive start block token phase");
                     for &mut byte in bytes_to_process {
                         bytes_processed += 1;
                         if byte != 0xFF {
@@ -187,10 +162,6 @@ pub async fn card_command<S: SpiBus>(
                                 phase = Phase::ReceiveData((CRC.digest(), parts_read, 0));
                                 break;
                             } else {
-                                defmt::error!(
-                                    "expected start block token, but got 0x{:02X} instead",
-                                    byte
-                                );
                                 return Err(CardCommand3Error::ExpectedStartBlockToken);
                             }
                         }
@@ -206,7 +177,6 @@ pub async fn card_command<S: SpiBus>(
                     }
                 }
                 Phase::ReceiveData((mut digest, parts_read, bytes_received)) => {
-                    defmt::trace!("receive data phase: {}", bytes_received);
                     let operation =
                         if let Some(CardCommandOperation::Read(operation)) = &mut operation {
                             operation
@@ -236,7 +206,6 @@ pub async fn card_command<S: SpiBus>(
                                 (0, 0, 0)
                             }
                         };
-                        defmt::trace!("copy_len: {}", copy_len);
                         // check for end
                         let copy_len = if dest_start + copy_len > operation.buffer.len() {
                             let skip_end = dest_start + copy_len - operation.buffer.len();
@@ -244,16 +213,6 @@ pub async fn card_command<S: SpiBus>(
                         } else {
                             copy_len
                         };
-                        defmt::trace!(
-                            "start: {}. dest_start: {}. src_start: {}. copy_len: {}. parts_read: {}. bytes_received: {}. read_len: {}",
-                            start,
-                            dest_start,
-                            src_start,
-                            copy_len,
-                            parts_read,
-                            bytes_received,
-                            read_len
-                        );
                         let dest = &mut operation.buffer[dest_start..dest_start + copy_len];
                         let src = &bytes_to_read[src_start..src_start + copy_len];
                         dest.copy_from_slice(src);
@@ -265,14 +224,9 @@ pub async fn card_command<S: SpiBus>(
                         phase = Phase::ReceiveCrc((digest.finalize(), parts_read, None));
                     } else {
                         phase = Phase::ReceiveData((digest, parts_read, new_bytes_received));
-                        defmt::trace!(
-                            "did not receive all data in a single transfer (missing {} bytes)",
-                            operation.part_size - new_bytes_received
-                        );
                     }
                 }
                 Phase::ReceiveCrc((expected_crc, parts_read, byte_0)) => {
-                    defmt::trace!("receive CRC phase: {}", byte_0);
                     if let Some(byte_0) = byte_0 {
                         let byte_1 = bytes_to_process[0];
                         bytes_processed += 1;
@@ -304,7 +258,6 @@ pub async fn card_command<S: SpiBus>(
                 Phase::WriteData(_) => todo!(),
             }
         }
-        defmt::trace!("procesing time: {} us", before.elapsed().as_micros());
 
         // Set up buffer
         let bytes_to_transfer = match &phase {
@@ -423,17 +376,9 @@ pub async fn card_command<S: SpiBus>(
             Phase::WriteData(_) => todo!(),
         };
         assert_ne!(bytes_to_transfer, 0, "{:#?}", phase);
-        defmt::trace!("transferring...");
-        let before = Instant::now();
         spi.transfer_in_place(&mut buffer[..bytes_to_transfer])
             .await
             .map_err(CardCommand3Error::Spi)?;
-        defmt::trace!(
-            "Transferred {} bytes in {} us",
-            bytes_to_transfer,
-            before.elapsed().as_micros()
-        );
-        defmt::trace!("Bytes: {:02X}", &mut buffer[..bytes_to_transfer]);
         buffer_valid_bytes = bytes_to_transfer;
     }
     Ok(())
