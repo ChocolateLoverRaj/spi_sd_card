@@ -70,7 +70,7 @@ pub struct R7 {
     pub byte_0: R1,
     pub byte_1: R7Byte1,
     /// All reserved bits
-    byte_2: u8,
+    pub(crate) byte_2: u8,
     pub byte_3: R7Byte3,
     pub check_pattern: u8,
 }
@@ -121,8 +121,8 @@ bitflags! {
 #[derive(Debug)]
 #[repr(C)]
 pub struct R3 {
-    r1: R1,
-    ocr: Ocr,
+    pub r1: R1,
+    pub ocr: Ocr,
 }
 
 impl Ocr {
@@ -135,7 +135,7 @@ impl Ocr {
         self.contains(Self::CARD_POWER_UP_STATUS)
     }
 
-    /// Note that if the card is powered up, the `CCS` bit is not valid, so the card must be powered up to know.
+    /// Note that if the card is not powered up, the `CCS` bit is not valid, so the card must be powered up to know.
     pub fn supports_sdhc_or_sdxc(&self) -> Option<bool> {
         if self.is_powered_up() {
             Some(self.contains(Self::CARD_CAPACITY_STATUS))
