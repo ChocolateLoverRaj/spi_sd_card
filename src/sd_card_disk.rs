@@ -182,9 +182,9 @@ where
                     + EXPECTED_BYTES_UNTIL_RESPONSE
                     + size_of::<R1>()
                     + BYTES_UNTIL_CSD
-                    + size_of::<CsdV2>()];
+                    + size_of::<CsdV2Old>()];
             let mut response = [Default::default(); size_of::<R1>()];
-            let mut csd_bytes = [Default::default(); size_of::<CsdV2>()];
+            let mut csd_bytes = [Default::default(); size_of::<CsdV2Old>()];
             card_command(
                 spi.deref_mut(),
                 &mut buffer,
@@ -214,7 +214,7 @@ where
             if !r1.is_empty() {
                 return Err(Error::SendCsdResponseError);
             }
-            CsdV2(u128::from_be_bytes(csd_bytes))
+            CsdV2Old(u128::from_be_bytes(csd_bytes))
         };
 
         spi.flush().await.map_err(Error::SpiBus)?;

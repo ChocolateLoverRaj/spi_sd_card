@@ -1,3 +1,4 @@
+use arbitrary_int::{u2, u3, u4, u12, u22};
 use bitfield::bitfield;
 use bitflags::bitflags;
 
@@ -109,7 +110,7 @@ bitflags! {
         const _3_2V_3_3V = 1 << 20;
         const _3_3V_3_4V = 1 << 21;
         const _3_4V_3_5V = 1 << 22;
-        const _2_5V_3_6V = 1 << 23;
+        const _3_5V_3_6V = 1 << 23;
         const S18A = 1 << 24;
         const CO2T = 1 << 27;
         const UHS_II = 1 << 29;
@@ -167,13 +168,69 @@ bitfield! {
     bool; pub get_bit_0, set_bit_0: 0;
 }
 
+#[bitbybit::bitfield(u128)]
+pub struct CsdCommon {
+    #[bits(126..=127, r)]
+    csd_structure: u2,
+}
+
+impl Csd for CsdCommon {
+    fn card_capacity_bytes(&self) -> u64 {
+        match self.csd_structure() {
+            a if a == u2::new(0) => todo!(),
+            a if a == u2::new(1) => CsdV2Old(self.raw_value).card_capacity_bytes(),
+            a if a == u2::new(2) => todo!(),
+            a if a == u2::new(3) => {
+                // This is actually reserved
+                todo!()
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+pub trait Csd {
+    fn card_capacity_bytes(&self) -> u64;
+}
+
+#[bitbybit::bitfield(u128)]
+pub struct CsdV1 {
+    #[bits(80..=83, r)]
+    read_bl_len: u4,
+    #[bits(62..=73, r)]
+    c_size: u12,
+    #[bits(47..=49, r)]
+    c_size_mult: u3,
+}
+
+impl Csd for CsdV1 {
+    fn card_capacity_bytes(&self) -> u64 {
+        let block_len = 2_u32.pow(self.read_bl_len().value().into());
+        let mult = 2_u32.pow(u32::from(self.c_size_mult().value()) * 2);
+        let blocknr = (u32::from(self.c_size().value()) + 1) * mult;
+        (blocknr * block_len).into()
+    }
+}
+
+#[bitbybit::bitfield(u128)]
+pub struct CsdV2 {
+    #[bits(48..=69, r)]
+    c_size: u22,
+}
+
+impl Csd for CsdV2 {
+    fn card_capacity_bytes(&self) -> u64 {
+        (u64::from(self.c_size().value()) + 1) * 512 * 1024
+    }
+}
+
 bitfield! {
-    pub struct CsdV2(u128);
+    pub struct CsdV2Old(u128);
 
     u32; pub get_c_size, set_c_size: 75, 48;
 }
 
-impl CsdV2 {
+impl CsdV2Old {
     pub fn card_capacity_bytes(&self) -> u64 {
         (u64::from(self.get_c_size()) + 1) * 512 * 1024
     }
@@ -237,3 +294,15 @@ impl Mdt {
 pub const START_BLOCK_TOKEN: u8 = 0b1111_1110;
 
 pub type Command = [u8; 6];
+
+#[bitbybit::bitfield(u8, debug)]
+pub struct DataErrorToken {
+    #[bit(3, r)]
+    pub out_of_range: bool,
+    #[bit(2, r)]
+    pub card_ecc_failed: bool,
+    #[bit(1, r)]
+    pub cc_error: bool,
+    #[bit(0, r)]
+    pub error: bool,
+}

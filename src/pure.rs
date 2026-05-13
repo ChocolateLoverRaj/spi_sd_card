@@ -1,6 +1,8 @@
+use crc::{CRC_16_XMODEM, Crc, Table};
+
 use crate::{
-    Command, Command8Argument, Command59Argument, CommandA41Argument, R1, R7, R7Byte1, R7Byte3,
-    VoltageAccpted, format_command,
+    Command, Command8Argument, Command59Argument, CommandA41Argument, DataErrorToken, R1, R7,
+    R7Byte1, R7Byte3, START_BLOCK_TOKEN, VoltageAccpted, format_command,
 };
 
 // Command-level stuff
@@ -72,7 +74,7 @@ pub enum Command0Process {
 pub struct UnexpectedCmd0Response(pub R1);
 
 pub fn process_cmd_0_response(response: R1) -> Result<(), UnexpectedCmd0Response> {
-    if response == R1::IN_IDLE_STATE {
+    if response == R1::IN_IDLE_STATE || response.is_empty() {
         Ok(())
     } else {
         Err(UnexpectedCmd0Response(response))
@@ -203,7 +205,7 @@ pub fn format_cmd_55() -> Command {
 }
 
 pub fn process_cmd_55_response(response: R1) -> Result<(), UnexpectedCmd55Response> {
-    if response == R1::IN_IDLE_STATE {
+    if response == R1::IN_IDLE_STATE || response.is_empty() {
         Ok(())
     } else {
         Err(UnexpectedCmd55Response(response))
@@ -241,185 +243,261 @@ pub enum Acmd41Output {
 #[derive(Debug)]
 pub struct UnexpectedAcmd41Res(pub R1);
 
-// #[derive(Debug)]
-// pub struct ResetAndInit {
-//     step: Step,
-// }
-
-// impl Default for ResetAndInit {
-//     fn default() -> Self {
-//         Self {
-//             step: Step::SendClockCycles,
-//         }
-//     }
-// }
-
-// pub enum Action {
-//     /// Create a buffer initialized to 0xFF, call the prepare fn, then transfer in place
-//     TransferInPlace(usize),
-//     SetCs(PinState),
-// }
-
-// #[derive(Debug)]
-// pub enum Step {
-//     SendClockCycles,
-//     SetCsLow,
-//     Cmd0,
-//     Cmd8(heapless::Vec<u8, { size_of::<R7>() }>),
-// }
-
-// pub enum ActionResponse<'a> {
-//     Transferred(&'a [u8]),
-//     SetCs,
-// }
-
-// #[derive(Debug)]
-// pub enum CardError {
-//     NoResponse,
-//     BadResponse(R1),
-// }
-
-// #[derive(Debug)]
-// pub enum Next {
-//     Init(ResetAndInit),
-//     Done,
-// }
-
 /// The check pattern can be anything we want
 const CHECK_PATTERN: u8 = 0xE2;
 
-// const EXPECTED_BYTES_UNTIL_CMD0_RESPONSE: usize = 2;
+pub fn format_cmd_9() -> Command {
+    format_command(9, 0)
+}
 
-// impl ResetAndInit {
-//     pub fn action(&self) -> Action {
-//         match self.step {
-//             Step::SendClockCycles => Action::TransferInPlace(9),
-//             Step::SetCsLow => Action::SetCs(PinState::Low),
-//             Step::Cmd0 => Action::TransferInPlace(
-//                 size_of::<Command>() + EXPECTED_BYTES_UNTIL_CMD0_RESPONSE + size_of::<R1>(),
-//             ),
-//             Step::Cmd8(response) => Action::TransferInPlace {
-//                 len: size_of::<Command>() + 2 + size_of::<R7>(),
-//                 prepare: {
-//                     let a = true;
-//                     move |buffer| {
-//                         if a {
-//                         } else {
-//                         }
-//                         let command = format_command(8, {
-//                             let mut argument = Command8Argument(Default::default());
-//                             argument.set_pcie1_2v_support(false);
-//                             argument.set_pcie_availability(false);
-//                             argument.set_voltage_accepted(VoltageAccpted::_2_7V_3_6V.bits());
-//                             argument.set_check_pattern(CHECK_PATTERN);
-//                             argument.0
-//                         });
-//                         buffer[..command.len()].copy_from_slice(&command);
-//                     }
-//                 },
-//             },
-//             _ => todo!(),
-//         }
-//     }
+enum ReadSinglePhase {
+    WaitForR1,
+    WaitForData,
+    ProcessData,
+}
 
-//     pub fn prepare_buffer(&self, buffer: &mut [u8]) {
-//         match self.step {
-//             Step::Cmd0 => buffer[..size_of::<Command>()].copy_from_slice(&format_command(0, 0)),
-//             Step::Cmd8(response) => {
-//                 if response
-//                 let command = format_command(8, {
-//                     let mut argument = Command8Argument(Default::default());
-//                     argument.set_pcie1_2v_support(false);
-//                     argument.set_pcie_availability(false);
-//                     argument.set_voltage_accepted(VoltageAccpted::_2_7V_3_6V.bits());
-//                     argument.set_check_pattern(CHECK_PATTERN);
-//                     argument.0
-//                 });
-//                 buffer[..command.len()].copy_from_slice(&command);
-//             }
-//         }
-//     }
+pub struct ReadSingleCmd {
+    len: usize,
+    phase: ReadSinglePhase,
+}
 
-//     pub fn next(self, response: ActionResponse<'_>) -> Result<Next, CardError> {
-//         match self.step {
-//             Step::SendClockCycles => Ok(Next::Init(Self {
-//                 step: Step::SetCsLow,
-//             })),
-//             Step::SetCsLow => Ok(Next::Init(Self { step: Step::Cmd0 })),
-//             Step::Cmd0 => {
-//                 let buffer = match response {
-//                     ActionResponse::Transferred(buffer) => buffer,
-//                     _ => unreachable!(),
-//                 };
-//                 let r1 = R1::from_bits_retain(
-//                     buffer
-//                         .iter()
-//                         .copied()
-//                         .find(|byte| *byte != 0xFF)
-//                         .ok_or(CardError::NoResponse)?,
-//                 );
-//                 if r1 == R1::IN_IDLE_STATE {
-//                     Ok(Next::Init(Self { step: Step::Cmd8 }))
-//                 } else {
-//                     Err(CardError::BadResponse(r1))
-//                 }
-//             }
-//             Step::Cmd8 => {
-//                 let buffer = match response {
-//                     ActionResponse::Transferred(buffer) => buffer,
-//                     _ => unreachable!(),
-//                 };
-//                 let response_position = buffer
-//                     .iter()
-//                     .copied()
-//                     .position(|byte| byte != 0xFF)
-//                     .ok_or(CardError::NoResponse)?;
-//                 let slice_end = response_position + size_of::<R7>();
-//                 let response = &buffer[response_position..slice_end];
-//                 Ok(Next::Init(Self { step: Step::Cmd8 }))
-//             }
-//             _ => todo!(),
-//         }
-//     }
-// }
+impl ReadSingleCmd {
+    pub fn new(len: usize) -> Self {
+        Self {
+            len,
+            phase: ReadSinglePhase::WaitForR1,
+        }
+    }
 
-// pub trait TransferInPlaceNext {
-//     type Output;
+    pub fn process_bytes(
+        mut self,
+        data: &[u8],
+        new_start: usize,
+    ) -> Result<ReadSingleProcess, ReadSingleError> {
+        let mut i = new_start;
+        let mut keep_start = 0;
+        loop {
+            match self.phase {
+                ReadSinglePhase::WaitForR1 => {
+                    if let Some(r1_pos) = data[i..].iter().position(|byte| *byte != 0xFF) {
+                        let r1 = R1::from_bits_retain(data[i + r1_pos]);
+                        if r1 == R1::empty() {
+                            i += r1_pos + 1;
+                            keep_start = i;
+                            self.phase = ReadSinglePhase::WaitForData;
+                        } else {
+                            return Err(ReadSingleError::UnexpectedResponse(r1));
+                        }
+                    } else {
+                        return Ok(ReadSingleProcess::InProgress {
+                            cmd: self,
+                            keep_start: data.len(),
+                        });
+                    }
+                }
+                ReadSinglePhase::WaitForData => {
+                    if let Some(data_pos) =
+                        data[i..].iter().position(|byte| *byte == START_BLOCK_TOKEN)
+                    {
+                        i += data_pos + 1;
+                        keep_start = i;
+                        self.phase = ReadSinglePhase::ProcessData;
+                    } else {
+                        return Ok(ReadSingleProcess::InProgress {
+                            cmd: self,
+                            keep_start: data.len(),
+                        });
+                    }
+                }
+                ReadSinglePhase::ProcessData => {
+                    if (keep_start..data.len()).len() >= self.len + size_of::<u16>() {
+                        // Check CRC
+                        let actual_data = &data[keep_start..keep_start + self.len];
+                        let received_crc = u16::from_be_bytes(
+                            data[keep_start + self.len..keep_start + self.len + size_of::<u16>()]
+                                .try_into()
+                                .unwrap(),
+                        );
+                        let crc_builder = Crc::<u16>::new(&CRC_16_XMODEM);
+                        let mut digest = crc_builder.digest();
+                        digest.update(actual_data);
+                        let computed_crc = digest.finalize();
+                        if computed_crc != received_crc {
+                            return Err(ReadSingleError::CrcError {
+                                data_start: keep_start,
+                            });
+                        }
+                        return Ok(ReadSingleProcess::Done {
+                            data_start: keep_start,
+                        });
+                    } else {
+                        return Ok(ReadSingleProcess::InProgress {
+                            cmd: self,
+                            keep_start,
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
 
-//     fn process(self, buffer: &[u8]) -> Self::Output;
-// }
+pub enum ReadSingleProcess {
+    InProgress {
+        cmd: ReadSingleCmd,
+        keep_start: usize,
+    },
+    Done {
+        data_start: usize,
+    },
+}
 
-// pub struct TransferInPlaceAction<Next> {
-//     buffer_len: usize,
-//     prepare_buffer: fn(&mut [u8]),
-//     next: Next,
-// }
+#[derive(Debug)]
+pub enum ReadSingleError {
+    UnexpectedResponse(R1),
+    CrcError {
+        /// Start of data (which could be corrupted due to CRC mismatch)
+        data_start: usize,
+    },
+}
 
-// impl<Next: TransferInPlaceNext> TransferInPlaceAction<Next> {
-//     pub fn buffer_len(&self) -> usize {
-//         self.buffer_len
-//     }
+pub fn format_cmd_17(block_number: u32) -> Command {
+    format_command(17, block_number)
+}
 
-//     pub fn prepare_buffer(&self, buffer: &mut [u8]) {
-//         (self.prepare_buffer)(buffer)
-//     }
+pub fn format_cmd_18(block_number: u32) -> Command {
+    format_command(18, block_number)
+}
 
-//     pub fn next(self, buffer: &[u8]) -> Next::Output {
-//         self.next.process(buffer)
-//     }
-// }
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug)]
+enum ReadMultiPhase {
+    ReceiveResponse,
+    ReceiveStartToken,
+    ReceiveDataAndCrc,
+}
 
-// pub struct SetCsAction<Next> {
-//     pin_state: PinState,
-//     next: Next,
-// }
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug)]
+pub struct ReadMultiCmd {
+    block_len: usize,
+    phase: ReadMultiPhase,
+}
 
-// impl<Next> SetCsAction<Next> {
-//     pub fn pin_state(&self) -> PinState {
-//         self.pin_state
-//     }
+impl ReadMultiCmd {
+    pub fn new(block_len: usize) -> Self {
+        Self {
+            block_len,
+            phase: ReadMultiPhase::ReceiveResponse,
+        }
+    }
 
-//     pub fn next(self) -> Next {
-//         self.next
-//     }
-// }
+    pub fn process_bytes(mut self, buffer: &[u8]) -> Result<ReadMultiOutput, ProcessBlockError> {
+        let mut keep_start = 0;
+        let mut process_index = 0;
+        loop {
+            match self.phase {
+                ReadMultiPhase::ReceiveResponse => {
+                    if let Some(r1_pos) = buffer[process_index..]
+                        .iter()
+                        .position(|byte| *byte != 0xFF)
+                    {
+                        let r1 = R1::from_bits_retain(buffer[process_index + r1_pos]);
+                        if r1 != R1::empty() {
+                            break Err(ProcessBlockError::UnexpectedResponse(r1));
+                        }
+                        process_index += r1_pos + 1;
+                        keep_start = process_index;
+                        self.phase = ReadMultiPhase::ReceiveStartToken;
+                    } else {
+                        break Ok(ReadMultiOutput {
+                            cmd: self,
+                            keep_start,
+                            processed_block: None,
+                        });
+                    }
+                }
+                ReadMultiPhase::ReceiveStartToken => {
+                    if let Some(token_pos) = buffer[process_index..]
+                        .iter()
+                        .position(|byte| *byte != 0xFF)
+                    {
+                        let token = buffer[process_index + token_pos];
+                        if token != START_BLOCK_TOKEN {
+                            break Err(ProcessBlockError::DataError(
+                                DataErrorToken::new_with_raw_value(token),
+                            ));
+                        }
+                        process_index += token_pos + 1;
+                        keep_start = process_index;
+                        self.phase = ReadMultiPhase::ReceiveDataAndCrc;
+                    } else {
+                        break Ok(ReadMultiOutput {
+                            cmd: self,
+                            keep_start,
+                            processed_block: None,
+                        });
+                    }
+                }
+                ReadMultiPhase::ReceiveDataAndCrc => {
+                    if (keep_start..buffer.len()).len() >= self.block_len + size_of::<u16>() {
+                        // Check CRC
+                        let actual_data = &buffer[keep_start..keep_start + self.block_len];
+                        let received_crc = u16::from_be_bytes(
+                            buffer[keep_start + self.block_len
+                                ..keep_start + self.block_len + size_of::<u16>()]
+                                .try_into()
+                                .unwrap(),
+                        );
+                        const CRC: Crc<u16, Table<16>> = Crc::<u16, Table<16>>::new(&CRC_16_XMODEM);
+                        let mut digest = CRC.digest();
+                        digest.update(actual_data);
+                        let computed_crc = digest.finalize();
+                        let data_start = keep_start;
+                        keep_start += self.block_len + size_of::<u16>();
+                        self.phase = ReadMultiPhase::ReceiveStartToken;
+                        break Ok(ReadMultiOutput {
+                            cmd: self,
+                            keep_start,
+                            processed_block: Some(if computed_crc == received_crc {
+                                Ok(data_start)
+                            } else {
+                                Err(ProcessedBlockCrcError { start: data_start })
+                            }),
+                        });
+                    } else {
+                        break Ok(ReadMultiOutput {
+                            cmd: self,
+                            keep_start,
+                            processed_block: None,
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug)]
+pub struct ReadMultiOutput {
+    pub cmd: ReadMultiCmd,
+    /// You can throw away bytes before this position if you want. Next time you call the process
+    /// bytes function, start at this position.
+    pub keep_start: usize,
+    /// If this is `Some`, call the process bytes function again immediately to process more blocks
+    /// if available.
+    pub processed_block: Option<Result<usize, ProcessedBlockCrcError>>,
+}
+
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug)]
+pub struct ProcessedBlockCrcError {
+    pub start: usize,
+}
+
+#[derive(Debug)]
+pub enum ProcessBlockError {
+    UnexpectedResponse(R1),
+    DataError(DataErrorToken),
+}
