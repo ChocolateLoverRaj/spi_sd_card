@@ -177,8 +177,8 @@ pub struct CsdCommon {
 impl Csd for CsdCommon {
     fn card_capacity_bytes(&self) -> u64 {
         match self.csd_structure() {
-            a if a == u2::new(0) => todo!(),
-            a if a == u2::new(1) => CsdV2Old(self.raw_value).card_capacity_bytes(),
+            a if a == u2::new(0) => CsdV1::new_with_raw_value(self.raw_value).card_capacity_bytes(),
+            a if a == u2::new(1) => CsdV2::new_with_raw_value(self.raw_value).card_capacity_bytes(),
             a if a == u2::new(2) => todo!(),
             a if a == u2::new(3) => {
                 // This is actually reserved

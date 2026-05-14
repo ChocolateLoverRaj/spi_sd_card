@@ -1,8 +1,8 @@
-use crc::{CRC_16_XMODEM, Crc, Digest, Table};
+use crc::{CRC_16_XMODEM, Crc, Table};
 
 use crate::{
-    Command, Command8Argument, Command59Argument, CommandA41Argument, DataErrorToken, R1, R7,
-    R7Byte1, R7Byte3, START_BLOCK_TOKEN, VoltageAccpted, format_command,
+    Command, Command8Argument, Command59Argument, CommandA41Argument, DataErrorToken, R1, R7Byte3,
+    START_BLOCK_TOKEN, VoltageAccpted, format_command,
 };
 
 // Command-level stuff
@@ -19,9 +19,7 @@ impl<const N: usize> SimpleCommand<N> {
             let response_pos = bytes.iter().position(|byte| *byte != 0xFF);
             if let Some(response_pos) = response_pos {
                 self.response
-                    .extend_from_slice(
-                        &bytes[response_pos..bytes.len().min(response_pos + size_of::<R7>())],
-                    )
+                    .extend_from_slice(&bytes[response_pos..bytes.len().min(response_pos + N)])
                     .unwrap();
             }
         } else {
@@ -45,36 +43,11 @@ pub fn format_command_0() -> Command {
     format_command(0, 0)
 }
 
-/// Buffer len must be at least 6.
-pub fn prepare_command_0(buffer: &mut [u8]) {
-    let command = format_command(0, 0);
-    buffer[..command.len()].copy_from_slice(&command);
-}
-
-/// Call prepare_command_0, then send it, then send dummy bytes. Then call process_bytes.
-pub struct Command0;
-impl Command0 {
-    pub fn process_bytes(self, bytes: &[u8]) -> Command0Process {
-        if let Some(byte) = bytes.iter().copied().find(|byte| *byte != 0xFF) {
-            Command0Process::Done(R1::from_bits_retain(byte))
-        } else {
-            Command0Process::InProgress(self)
-        }
-    }
-}
-
-pub enum Command0Process {
-    /// Continue transmitting 0xFFs unless you want to timeout
-    InProgress(Command0),
-    /// Stop transmitting 0xFFs
-    Done(R1),
-}
-
 #[derive(Debug)]
 pub struct UnexpectedCmd0Response(pub R1);
 
 pub fn process_cmd_0_response(response: R1) -> Result<(), UnexpectedCmd0Response> {
-    if response == R1::IN_IDLE_STATE || response.is_empty() {
+    if response == R1::IN_IDLE_STATE {
         Ok(())
     } else {
         Err(UnexpectedCmd0Response(response))
@@ -92,52 +65,6 @@ pub fn format_cmd_8() -> Command {
     })
 }
 
-/// Assumes 3.3V power to SD card
-#[derive(Default)]
-pub struct Command8 {
-    response: heapless::Vec<u8, { size_of::<R7>() - 1 }>,
-}
-
-impl Command8 {
-    pub fn process_bytes(self, bytes: &[u8]) -> Command8Process {
-        let mut response =
-            heapless::Vec::<u8, { size_of::<R7>() }>::from_slice(&self.response).unwrap();
-        if self.response.is_empty() {
-            // Find first non-0xFF
-            let response_pos = bytes.iter().position(|byte| *byte != 0xFF);
-            if let Some(response_pos) = response_pos {
-                response
-                    .extend_from_slice(
-                        &bytes[response_pos..bytes.len().min(response_pos + size_of::<R7>())],
-                    )
-                    .unwrap();
-            }
-        } else {
-            response
-                .extend_from_slice(&bytes[..bytes.len().min(size_of::<R7>() - response.len())])
-                .unwrap();
-        }
-        if response.is_full() {
-            Command8Process::Done(R7 {
-                byte_0: R1::from_bits_retain(response[0]),
-                byte_1: R7Byte1(response[1]),
-                byte_2: response[2],
-                byte_3: R7Byte3(response[3]),
-                check_pattern: response[4],
-            })
-        } else {
-            Command8Process::InProgress(Self {
-                response: heapless::Vec::from_slice(&response).unwrap(),
-            })
-        }
-    }
-}
-
-pub enum Command8Process {
-    InProgress(Command8),
-    Done(R7),
-}
-
 #[derive(Debug)]
 pub enum Cmd8Error {
     UnexpectedR1(R1),
@@ -145,16 +72,20 @@ pub enum Cmd8Error {
     UnexpectedCheckPattern(u8),
 }
 
-pub fn process_cmd_8_res(res: R7) -> Result<(), Cmd8Error> {
-    if res.byte_0 != R1::IN_IDLE_STATE {
-        return Err(Cmd8Error::UnexpectedR1(res.byte_0));
+pub type Cmd8Res = [u8; 5];
+
+pub fn process_cmd_8_res(res: Cmd8Res) -> Result<(), Cmd8Error> {
+    let r1 = R1::from_bits_retain(res[0]);
+    if r1 != R1::IN_IDLE_STATE {
+        return Err(Cmd8Error::UnexpectedR1(r1));
     }
-    let voltage_accepted = res.byte_3.get_voltage_accepted();
+    let voltage_accepted = R7Byte3(res[3]).get_voltage_accepted();
     if !voltage_accepted.contains(VoltageAccpted::_2_7V_3_6V) {
         return Err(Cmd8Error::VoltageNotAccepted(voltage_accepted));
     }
-    if res.check_pattern != CHECK_PATTERN {
-        return Err(Cmd8Error::UnexpectedCheckPattern(res.check_pattern));
+    let check_pattern = res[4];
+    if check_pattern != CHECK_PATTERN {
+        return Err(Cmd8Error::UnexpectedCheckPattern(check_pattern));
     }
     Ok(())
 }
@@ -169,24 +100,6 @@ pub fn format_cmd_59(crc_on: bool) -> Command {
         }
         .bits(),
     )
-}
-
-pub struct Command59;
-impl Command59 {
-    pub fn process_bytes(self, bytes: &[u8]) -> Command59Process {
-        if let Some(byte) = bytes.iter().copied().find(|byte| *byte != 0xFF) {
-            Command59Process::Done(R1::from_bits_retain(byte))
-        } else {
-            Command59Process::InProgress(self)
-        }
-    }
-}
-
-pub enum Command59Process {
-    /// Continue transmitting 0xFFs unless you want to timeout
-    InProgress(Command59),
-    /// Stop transmitting 0xFFs
-    Done(R1),
 }
 
 #[derive(Debug)]
@@ -253,7 +166,7 @@ pub fn format_cmd_9() -> Command {
 enum ReadSinglePhase {
     WaitForR1,
     WaitForData,
-    ProcessData,
+    ReceiveData { bytes_received: usize },
 }
 
 pub struct ReadSingleCmd {
@@ -269,69 +182,56 @@ impl ReadSingleCmd {
         }
     }
 
-    pub fn process_bytes(
-        mut self,
-        data: &[u8],
-        new_start: usize,
-    ) -> Result<ReadSingleProcess, ReadSingleError> {
-        let mut i = new_start;
-        let mut keep_start = 0;
+    pub fn process_bytes(mut self, bytes: &[u8]) -> Result<ReadSingleProcess, ReadSingleError> {
+        let mut bytes_processed = 0;
         loop {
             match self.phase {
                 ReadSinglePhase::WaitForR1 => {
-                    if let Some(r1_pos) = data[i..].iter().position(|byte| *byte != 0xFF) {
-                        let r1 = R1::from_bits_retain(data[i + r1_pos]);
+                    if let Some(r1_pos) = bytes.iter().position(|byte| *byte != 0xFF) {
+                        let r1 = R1::from_bits_retain(bytes[r1_pos]);
                         if r1 == R1::empty() {
-                            i += r1_pos + 1;
-                            keep_start = i;
+                            bytes_processed += r1_pos + 1;
                             self.phase = ReadSinglePhase::WaitForData;
                         } else {
-                            return Err(ReadSingleError::UnexpectedResponse(r1));
+                            break Err(ReadSingleError::UnexpectedResponse(r1));
                         }
                     } else {
-                        return Ok(ReadSingleProcess::InProgress {
+                        break Ok(ReadSingleProcess::InProgress {
                             cmd: self,
-                            keep_start: data.len(),
+                            keep_start: None,
                         });
                     }
                 }
                 ReadSinglePhase::WaitForData => {
-                    if let Some(data_pos) =
-                        data[i..].iter().position(|byte| *byte == START_BLOCK_TOKEN)
+                    if let Some(data_pos) = bytes[bytes_processed..]
+                        .iter()
+                        .position(|byte| *byte == START_BLOCK_TOKEN)
                     {
-                        i += data_pos + 1;
-                        keep_start = i;
-                        self.phase = ReadSinglePhase::ProcessData;
+                        bytes_processed += data_pos + 1;
+                        self.phase = ReadSinglePhase::ReceiveData { bytes_received: 0 };
                     } else {
-                        return Ok(ReadSingleProcess::InProgress {
+                        break Ok(ReadSingleProcess::InProgress {
                             cmd: self,
-                            keep_start: data.len(),
+                            keep_start: None,
                         });
                     }
                 }
-                ReadSinglePhase::ProcessData => {
-                    if (keep_start..data.len()).len() >= self.len + size_of::<u16>() {
-                        // Check CRC
-                        let actual_data = &data[keep_start..keep_start + self.len];
-                        let received_crc = u16::from_be_bytes(
-                            data[keep_start + self.len..keep_start + self.len + size_of::<u16>()]
-                                .try_into()
-                                .unwrap(),
-                        );
-                        let crc_builder = Crc::<u16>::new(&CRC_16_XMODEM);
-                        let mut digest = crc_builder.digest();
-                        digest.update(actual_data);
-                        let computed_crc = digest.finalize();
-                        if computed_crc != received_crc {
-                            return Err(ReadSingleError::CrcError {
-                                data_start: keep_start,
-                            });
-                        }
-                        return Ok(ReadSingleProcess::Done {
-                            data_start: keep_start,
-                        });
+                ReadSinglePhase::ReceiveData { bytes_received } => {
+                    let remaining = self.len + size_of::<u16>() - bytes_received;
+                    let bytes_available = bytes.len() - bytes_processed;
+                    if bytes_available >= remaining {
+                        bytes_processed += remaining;
+                        break Ok(ReadSingleProcess::Done { bytes_processed });
                     } else {
-                        return Ok(ReadSingleProcess::InProgress {
+                        self.phase = ReadSinglePhase::ReceiveData {
+                            bytes_received: bytes_received + bytes_available,
+                        };
+                        let keep_start = if bytes_received == 0 {
+                            Some(bytes_processed)
+                        } else {
+                            None
+                        };
+                        break Ok(ReadSingleProcess::InProgress {
                             cmd: self,
                             keep_start,
                         });
@@ -345,20 +245,16 @@ impl ReadSingleCmd {
 pub enum ReadSingleProcess {
     InProgress {
         cmd: ReadSingleCmd,
-        keep_start: usize,
+        keep_start: Option<usize>,
     },
     Done {
-        data_start: usize,
+        bytes_processed: usize,
     },
 }
 
 #[derive(Debug)]
 pub enum ReadSingleError {
     UnexpectedResponse(R1),
-    CrcError {
-        /// Start of data (which could be corrupted due to CRC mismatch)
-        data_start: usize,
-    },
 }
 
 pub fn format_cmd_17(block_number: u32) -> Command {
@@ -507,109 +403,6 @@ pub enum ProcessBlockError {
     DataError(DataErrorToken),
 }
 
-enum ReadMultiPhase2 {
-    WaitForResponse,
-    WaitForStartToken,
-    ReceiveData {
-        bytes_received: usize,
-        crc: Digest<'static, u16, Table<16>>,
-    },
-    ReceiveCrc {
-        computed_crc: u16,
-        bytes_received: heapless::Vec<u8, 2>,
-    },
-}
-
-pub struct ReadMultiCmd2 {
-    block_len: usize,
-    phase: ReadMultiPhase2,
-}
-
-impl ReadMultiCmd2 {
-    pub fn new(block_len: usize) -> Self {
-        Self {
-            block_len,
-            phase: ReadMultiPhase2::WaitForResponse,
-        }
-    }
-
-    pub fn process_byte(mut self, byte: u8) -> Result<ReadMultiItem, ProcessBlockError> {
-        match &mut self.phase {
-            ReadMultiPhase2::WaitForResponse => {
-                if byte != 0xFF {
-                    self.phase = ReadMultiPhase2::WaitForStartToken;
-                }
-                Ok(ReadMultiItem {
-                    cmd: self,
-                    keep_byte: false,
-                    processed_block: None,
-                })
-            }
-            ReadMultiPhase2::WaitForStartToken => {
-                if byte != 0xFF {
-                    self.phase = ReadMultiPhase2::ReceiveData {
-                        bytes_received: 0,
-                        crc: CRC.digest(),
-                    };
-                }
-                Ok(ReadMultiItem {
-                    cmd: self,
-                    keep_byte: false,
-                    processed_block: None,
-                })
-            }
-            ReadMultiPhase2::ReceiveData {
-                bytes_received,
-                crc,
-            } => {
-                *bytes_received += 1;
-                crc.update(&[byte]);
-                if *bytes_received == self.block_len {
-                    let computed_crc = crc.clone().finalize();
-                    self.phase = ReadMultiPhase2::ReceiveCrc {
-                        computed_crc,
-                        bytes_received: Default::default(),
-                    }
-                }
-                Ok(ReadMultiItem {
-                    cmd: self,
-                    keep_byte: true,
-                    processed_block: None,
-                })
-            }
-            ReadMultiPhase2::ReceiveCrc {
-                computed_crc,
-                bytes_received,
-            } => {
-                bytes_received.push(byte).unwrap();
-                if bytes_received.is_full() {
-                    let received_crc =
-                        u16::from_be_bytes(bytes_received.as_slice().try_into().unwrap());
-                    let computed_crc = *computed_crc;
-                    self.phase = ReadMultiPhase2::WaitForStartToken;
-                    Ok(ReadMultiItem {
-                        cmd: self,
-                        keep_byte: false,
-                        processed_block: Some(if received_crc == computed_crc {
-                            Ok(())
-                        } else {
-                            Err(())
-                        }),
-                    })
-                } else {
-                    Ok(ReadMultiItem {
-                        cmd: self,
-                        keep_byte: false,
-                        processed_block: None,
-                    })
-                }
-            }
-        }
-    }
-}
-
-pub struct ReadMultiItem {
-    pub cmd: ReadMultiCmd2,
-    pub keep_byte: bool,
-    pub processed_block: Option<Result<(), ()>>,
+pub fn format_cmd_12() -> Command {
+    format_command(12, 0)
 }
