@@ -1,4 +1,4 @@
-use crc::{CRC_16_XMODEM, Crc, Table};
+use crc::{CRC_16_XMODEM, Crc, Digest, Table};
 
 use crate::{
     Command, Command8Argument, Command59Argument, CommandA41Argument, DataErrorToken, R1, R7,
@@ -374,7 +374,7 @@ pub fn format_cmd_18(block_number: u32) -> Command {
 enum ReadMultiPhase {
     ReceiveResponse,
     ReceiveStartToken,
-    ReceiveDataAndCrc,
+    ReceiveDataAndCrc { bytes_received: usize },
 }
 
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -383,6 +383,8 @@ pub struct ReadMultiCmd {
     block_len: usize,
     phase: ReadMultiPhase,
 }
+
+pub const CRC: Crc<u16, Table<16>> = Crc::<u16, Table<16>>::new(&CRC_16_XMODEM);
 
 impl ReadMultiCmd {
     pub fn new(block_len: usize) -> Self {
@@ -393,83 +395,80 @@ impl ReadMultiCmd {
     }
 
     pub fn process_bytes(mut self, buffer: &[u8]) -> Result<ReadMultiOutput, ProcessBlockError> {
-        let mut keep_start = 0;
-        let mut process_index = 0;
+        let mut bytes_processed = 0;
+        let mut bytes_waited = 0;
         loop {
             match self.phase {
                 ReadMultiPhase::ReceiveResponse => {
-                    if let Some(r1_pos) = buffer[process_index..]
-                        .iter()
-                        .position(|byte| *byte != 0xFF)
-                    {
-                        let r1 = R1::from_bits_retain(buffer[process_index + r1_pos]);
+                    if let Some(r1_pos) = buffer.iter().position(|byte| *byte != 0xFF) {
+                        let r1 = R1::from_bits_retain(buffer[r1_pos]);
                         if r1 != R1::empty() {
                             break Err(ProcessBlockError::UnexpectedResponse(r1));
                         }
-                        process_index += r1_pos + 1;
-                        keep_start = process_index;
+                        bytes_waited += r1_pos;
+                        bytes_processed += r1_pos + 1;
                         self.phase = ReadMultiPhase::ReceiveStartToken;
                     } else {
                         break Ok(ReadMultiOutput {
                             cmd: self,
-                            keep_start,
-                            processed_block: None,
+                            keep_action: None,
+                            bytes_processed: buffer.len(),
+                            bytes_waited,
                         });
                     }
                 }
                 ReadMultiPhase::ReceiveStartToken => {
-                    if let Some(token_pos) = buffer[process_index..]
+                    if let Some(token_pos) = buffer[bytes_processed..]
                         .iter()
                         .position(|byte| *byte != 0xFF)
                     {
-                        let token = buffer[process_index + token_pos];
+                        let token = buffer[bytes_processed + token_pos];
                         if token != START_BLOCK_TOKEN {
                             break Err(ProcessBlockError::DataError(
                                 DataErrorToken::new_with_raw_value(token),
                             ));
                         }
-                        process_index += token_pos + 1;
-                        keep_start = process_index;
-                        self.phase = ReadMultiPhase::ReceiveDataAndCrc;
+                        bytes_waited += token_pos;
+                        bytes_processed += token_pos + 1;
+                        self.phase = ReadMultiPhase::ReceiveDataAndCrc { bytes_received: 0 };
                     } else {
                         break Ok(ReadMultiOutput {
                             cmd: self,
-                            keep_start,
-                            processed_block: None,
+                            keep_action: None,
+                            bytes_processed: buffer.len(),
+                            bytes_waited,
                         });
                     }
                 }
-                ReadMultiPhase::ReceiveDataAndCrc => {
-                    if (keep_start..buffer.len()).len() >= self.block_len + size_of::<u16>() {
-                        // Check CRC
-                        let actual_data = &buffer[keep_start..keep_start + self.block_len];
-                        let received_crc = u16::from_be_bytes(
-                            buffer[keep_start + self.block_len
-                                ..keep_start + self.block_len + size_of::<u16>()]
-                                .try_into()
-                                .unwrap(),
-                        );
-                        const CRC: Crc<u16, Table<16>> = Crc::<u16, Table<16>>::new(&CRC_16_XMODEM);
-                        let mut digest = CRC.digest();
-                        digest.update(actual_data);
-                        let computed_crc = digest.finalize();
-                        let data_start = keep_start;
-                        keep_start += self.block_len + size_of::<u16>();
+                ReadMultiPhase::ReceiveDataAndCrc { bytes_received } => {
+                    let bytes_available = buffer.len() - bytes_processed;
+                    let bytes_remaining = self.block_len + size_of::<u16>() - bytes_received;
+                    if bytes_available >= bytes_remaining {
+                        bytes_processed += bytes_remaining;
                         self.phase = ReadMultiPhase::ReceiveStartToken;
                         break Ok(ReadMultiOutput {
                             cmd: self,
-                            keep_start,
-                            processed_block: Some(if computed_crc == received_crc {
-                                Ok(data_start)
-                            } else {
-                                Err(ProcessedBlockCrcError { start: data_start })
-                            }),
+                            keep_action: Some(KeepAction::Take),
+                            bytes_processed,
+                            bytes_waited,
                         });
                     } else {
+                        self.phase = ReadMultiPhase::ReceiveDataAndCrc {
+                            bytes_received: bytes_received + bytes_available,
+                        };
+                        let keep_action = if bytes_received == 0 {
+                            Some(KeepAction::StartKeeping {
+                                position: bytes_processed,
+                            })
+                        } else {
+                            None
+                        };
+                        bytes_processed += bytes_available;
                         break Ok(ReadMultiOutput {
                             cmd: self,
-                            keep_start,
-                            processed_block: None,
+                            keep_action,
+                            bytes_processed,
+                            bytes_waited,
                         });
                     }
                 }
@@ -480,14 +479,20 @@ impl ReadMultiCmd {
 
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug)]
+pub enum KeepAction {
+    /// Started a data + crc block
+    StartKeeping { position: usize },
+    /// Done processing a data + crc block
+    Take,
+}
+
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug)]
 pub struct ReadMultiOutput {
     pub cmd: ReadMultiCmd,
-    /// You can throw away bytes before this position if you want. Next time you call the process
-    /// bytes function, start at this position.
-    pub keep_start: usize,
-    /// If this is `Some`, call the process bytes function again immediately to process more blocks
-    /// if available.
-    pub processed_block: Option<Result<usize, ProcessedBlockCrcError>>,
+    pub keep_action: Option<KeepAction>,
+    pub bytes_processed: usize,
+    pub bytes_waited: usize,
 }
 
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -500,4 +505,111 @@ pub struct ProcessedBlockCrcError {
 pub enum ProcessBlockError {
     UnexpectedResponse(R1),
     DataError(DataErrorToken),
+}
+
+enum ReadMultiPhase2 {
+    WaitForResponse,
+    WaitForStartToken,
+    ReceiveData {
+        bytes_received: usize,
+        crc: Digest<'static, u16, Table<16>>,
+    },
+    ReceiveCrc {
+        computed_crc: u16,
+        bytes_received: heapless::Vec<u8, 2>,
+    },
+}
+
+pub struct ReadMultiCmd2 {
+    block_len: usize,
+    phase: ReadMultiPhase2,
+}
+
+impl ReadMultiCmd2 {
+    pub fn new(block_len: usize) -> Self {
+        Self {
+            block_len,
+            phase: ReadMultiPhase2::WaitForResponse,
+        }
+    }
+
+    pub fn process_byte(mut self, byte: u8) -> Result<ReadMultiItem, ProcessBlockError> {
+        match &mut self.phase {
+            ReadMultiPhase2::WaitForResponse => {
+                if byte != 0xFF {
+                    self.phase = ReadMultiPhase2::WaitForStartToken;
+                }
+                Ok(ReadMultiItem {
+                    cmd: self,
+                    keep_byte: false,
+                    processed_block: None,
+                })
+            }
+            ReadMultiPhase2::WaitForStartToken => {
+                if byte != 0xFF {
+                    self.phase = ReadMultiPhase2::ReceiveData {
+                        bytes_received: 0,
+                        crc: CRC.digest(),
+                    };
+                }
+                Ok(ReadMultiItem {
+                    cmd: self,
+                    keep_byte: false,
+                    processed_block: None,
+                })
+            }
+            ReadMultiPhase2::ReceiveData {
+                bytes_received,
+                crc,
+            } => {
+                *bytes_received += 1;
+                crc.update(&[byte]);
+                if *bytes_received == self.block_len {
+                    let computed_crc = crc.clone().finalize();
+                    self.phase = ReadMultiPhase2::ReceiveCrc {
+                        computed_crc,
+                        bytes_received: Default::default(),
+                    }
+                }
+                Ok(ReadMultiItem {
+                    cmd: self,
+                    keep_byte: true,
+                    processed_block: None,
+                })
+            }
+            ReadMultiPhase2::ReceiveCrc {
+                computed_crc,
+                bytes_received,
+            } => {
+                bytes_received.push(byte).unwrap();
+                if bytes_received.is_full() {
+                    let received_crc =
+                        u16::from_be_bytes(bytes_received.as_slice().try_into().unwrap());
+                    let computed_crc = *computed_crc;
+                    self.phase = ReadMultiPhase2::WaitForStartToken;
+                    Ok(ReadMultiItem {
+                        cmd: self,
+                        keep_byte: false,
+                        processed_block: Some(if received_crc == computed_crc {
+                            Ok(())
+                        } else {
+                            Err(())
+                        }),
+                    })
+                } else {
+                    Ok(ReadMultiItem {
+                        cmd: self,
+                        keep_byte: false,
+                        processed_block: None,
+                    })
+                }
+            }
+        }
+    }
+}
+
+pub struct ReadMultiItem {
+    pub cmd: ReadMultiCmd2,
+    pub keep_byte: bool,
+    pub processed_block: Option<Result<(), ()>>,
 }
