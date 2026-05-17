@@ -3,6 +3,7 @@
 
 mod card_command;
 mod disk;
+mod em_hal;
 mod error;
 mod format_command;
 mod pure;

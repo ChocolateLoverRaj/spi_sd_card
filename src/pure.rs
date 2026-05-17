@@ -1,18 +1,47 @@
+use core::{mem, num::NonZero};
+
 use crc::{CRC_16_XMODEM, Crc, Table};
+use embedded_hal::digital::PinState;
 
 use crate::{
-    Command, Command8Argument, Command59Argument, CommandA41Argument, DataErrorToken, R1, R7Byte3,
-    START_BLOCK_TOKEN, VoltageAccpted, format_command,
+    Command, Command8Argument, Command59Argument, CommandA41Argument, DataErrorToken,
+    EXPECTED_BYTES_UNTIL_RESPONSE, R1, R7Byte3, START_BLOCK_TOKEN, VoltageAccpted, format_command,
 };
 
 // Command-level stuff
+enum SimpleCommandPhase {
+    SendCmd { bytes_sent: usize },
+    ReceiveResponse { bytes_sent: usize },
+}
 
-#[derive(Default)]
 pub struct SimpleCommand<const N: usize> {
+    phase: SimpleCommandPhase,
     response: heapless::Vec<u8, N>,
 }
 
+impl<const N: usize> Default for SimpleCommand<N> {
+    fn default() -> Self {
+        Self {
+            phase: SimpleCommandPhase::SendCmd { bytes_sent: 0 },
+            response: Default::default(),
+        }
+    }
+}
+
 impl<const N: usize> SimpleCommand<N> {
+    pub fn remaining_bytes(&self) -> RemainingBytes {
+        match self.phase {
+            SimpleCommandPhase::SendCmd { bytes_sent } => RemainingBytes {
+                min: size_of::<Command>() - bytes_sent + N,
+                expected: size_of::<Command>() - bytes_sent + EXPECTED_BYTES_UNTIL_RESPONSE + N,
+            },
+            SimpleCommandPhase::ReceiveResponse { bytes_sent } => RemainingBytes {
+                min: N,
+                expected: EXPECTED_BYTES_UNTIL_RESPONSE - bytes_sent + N,
+            },
+        }
+    }
+
     pub fn process_bytes(mut self, bytes: &[u8]) -> SimpleCmdProcess<N> {
         if self.response.is_empty() {
             // Find first non-0xFF
@@ -34,19 +63,25 @@ impl<const N: usize> SimpleCommand<N> {
     }
 }
 
+struct RemainingBytes {
+    min: usize,
+    expected: usize,
+}
+
 pub enum SimpleCmdProcess<const N: usize> {
     InProgress(SimpleCommand<N>),
     Done([u8; N]),
 }
 
-pub fn format_command_0() -> Command {
+pub fn format_cmd_0() -> Command {
     format_command(0, 0)
 }
 
 #[derive(Debug)]
 pub struct UnexpectedCmd0Response(pub R1);
 
-pub fn process_cmd_0_response(response: R1) -> Result<(), UnexpectedCmd0Response> {
+pub fn process_cmd_0_res(response: u8) -> Result<(), UnexpectedCmd0Response> {
+    let response = R1::from_bits_truncate(response);
     if response == R1::IN_IDLE_STATE {
         Ok(())
     } else {
@@ -406,3 +441,234 @@ pub enum ProcessBlockError {
 pub fn format_cmd_12() -> Command {
     format_command(12, 0)
 }
+
+#[derive(Debug)]
+pub struct CrcMismatch;
+
+pub fn check_crc(data: &[u8], crc: [u8; 2]) -> Result<(), CrcMismatch> {
+    let received_crc = u16::from_be_bytes(crc);
+    let mut digest = CRC.digest();
+    digest.update(data);
+    let computed_crc = digest.finalize();
+    if received_crc == computed_crc {
+        Ok(())
+    } else {
+        Err(CrcMismatch)
+    }
+}
+
+enum CmdPhase {
+    SetCsLow,
+    Transfer,
+    SetCsHigh,
+    SendClock,
+}
+
+enum InitPhase {
+    Set400Khz,
+    SendClocks,
+    Cmd0InProgress {
+        phase: CmdPhase,
+        command: SimpleCommand<{ size_of::<R1>() }>,
+        failed_attempts: usize,
+    },
+    Cmd0Complete {
+        phase: FinishCmdPhase,
+    },
+    Cmd0Failed {
+        phase: FinishCmdPhase,
+    },
+}
+
+enum FinishCmdPhase {
+    SetCsHigh,
+    SendClock,
+}
+
+pub struct Init {
+    phase: InitPhase,
+}
+
+impl Default for Init {
+    fn default() -> Self {
+        Self {
+            phase: InitPhase::Set400Khz,
+        }
+    }
+}
+
+impl Init {
+    pub fn action(&self) -> Action {
+        match &self.phase {
+            InitPhase::Set400Khz => Action::SetSpiRate(400_000),
+            InitPhase::SendClocks => Action::SendClocks(74 / 8),
+            InitPhase::Cmd0InProgress {
+                phase: CmdPhase::SetCsLow,
+                ..
+            } => Action::SetCs(PinState::Low),
+            InitPhase::Cmd0InProgress {
+                phase: CmdPhase::Transfer,
+                ..
+            } => Action::DoTransfer(TransferInfo {
+                min: size_of::<Command>() + size_of::<R1>(),
+                expected: size_of::<Command>() + EXPECTED_BYTES_UNTIL_RESPONSE + size_of::<R1>(),
+            }),
+            InitPhase::Cmd0InProgress {
+                phase: CmdPhase::SetCsHigh,
+                ..
+            } => Action::SetCs(PinState::High),
+            InitPhase::Cmd0InProgress {
+                phase: CmdPhase::SendClock,
+                ..
+            } => Action::SendClocks(1),
+            InitPhase::Cmd0Complete {
+                phase: FinishCmdPhase::SetCsHigh,
+            } => Action::SetCs(PinState::High),
+            InitPhase::Cmd0Complete {
+                phase: FinishCmdPhase::SendClock,
+            } => Action::SendClocks(1),
+            InitPhase::Cmd0Failed {
+                phase: FinishCmdPhase::SetCsHigh,
+            } => Action::SetCs(PinState::High),
+            InitPhase::Cmd0Failed {
+                phase: FinishCmdPhase::SendClock,
+            } => Action::SendClocks(1),
+        }
+    }
+
+    pub fn did_it(mut self, transferred_bytes: Option<&[u8]>) -> Result<InitOutput, InitError> {
+        match self.phase {
+            InitPhase::Set400Khz => {
+                self.phase = InitPhase::Set400Khz;
+                Ok(InitOutput::InProgress(self))
+            }
+            InitPhase::SendClocks => {
+                self.phase = InitPhase::Cmd0InProgress {
+                    phase: CmdPhase::SetCsLow,
+                    command: Default::default(),
+                    failed_attempts: 0,
+                };
+                Ok(InitOutput::InProgress(self))
+            }
+            InitPhase::Cmd0InProgress {
+                phase,
+                command,
+                failed_attempts,
+            } => match phase {
+                CmdPhase::SetCsLow => {
+                    self.phase = InitPhase::Cmd0InProgress {
+                        phase: CmdPhase::Transfer,
+                        command,
+                        failed_attempts,
+                    };
+                    Ok(InitOutput::InProgress(self))
+                }
+                CmdPhase::Transfer => {
+                    match command.process_bytes(transferred_bytes.unwrap()) {
+                        SimpleCmdProcess::InProgress(command) => {
+                            self.phase = InitPhase::Cmd0InProgress {
+                                phase,
+                                command,
+                                failed_attempts,
+                            };
+                        }
+                        SimpleCmdProcess::Done([response]) => match process_cmd_0_res(response) {
+                            Ok(()) => {
+                                self.phase = InitPhase::Cmd0Complete {
+                                    phase: FinishCmdPhase::SetCsHigh,
+                                };
+                            }
+                            Err(_e) => {
+                                let failed_attempts = failed_attempts + 1;
+                                if failed_attempts < MAX_CMD_0_ATTEMPTS {
+                                    self.phase = InitPhase::Cmd0InProgress {
+                                        phase: CmdPhase::SetCsHigh,
+                                        command: Default::default(),
+                                        failed_attempts: failed_attempts + 1,
+                                    };
+                                } else {
+                                    self.phase = InitPhase::Cmd0Failed {
+                                        phase: FinishCmdPhase::SetCsHigh,
+                                    };
+                                }
+                            }
+                        },
+                    }
+                    Ok(InitOutput::InProgress(self))
+                }
+                CmdPhase::SetCsHigh => {
+                    self.phase = InitPhase::Cmd0InProgress {
+                        phase: CmdPhase::SendClock,
+                        command,
+                        failed_attempts,
+                    };
+                    Ok(InitOutput::InProgress(self))
+                }
+                CmdPhase::SendClock => {
+                    self.phase = InitPhase::Cmd0InProgress {
+                        phase: CmdPhase::SetCsLow,
+                        command,
+                        failed_attempts,
+                    };
+                    Ok(InitOutput::InProgress(self))
+                }
+            },
+            InitPhase::Cmd0Complete {
+                phase: FinishCmdPhase::SetCsHigh,
+            } => {
+                self.phase = InitPhase::Cmd0Complete {
+                    phase: FinishCmdPhase::SendClock,
+                };
+                Ok(InitOutput::InProgress(self))
+            }
+            InitPhase::Cmd0Complete {
+                phase: FinishCmdPhase::SendClock,
+            } => {
+                todo!("next command");
+            }
+            InitPhase::Cmd0Failed {
+                phase: FinishCmdPhase::SetCsHigh,
+            } => {
+                self.phase = InitPhase::Cmd0Failed {
+                    phase: FinishCmdPhase::SendClock,
+                };
+                Ok(InitOutput::InProgress(self))
+            }
+            InitPhase::Cmd0Failed {
+                phase: FinishCmdPhase::SendClock,
+            } => Err(InitError::Cmd0Failed),
+        }
+    }
+
+    /// You are responsible for writing this followed by `0xFF`s
+    pub fn prepare_transfer(&self) -> [u8; 6] {
+        format_cmd_0()
+    }
+}
+
+pub enum InitError {
+    Cmd0Failed,
+}
+
+pub enum InitOutput {
+    InProgress(Init),
+    Done { card_capacity: NonZero<usize> },
+}
+
+pub enum Action {
+    /// Rate in Hz
+    SetSpiRate(u32),
+    /// Send [0xFF; n]
+    SendClocks(usize),
+    SetCs(PinState),
+    DoTransfer(TransferInfo),
+}
+
+pub struct TransferInfo {
+    pub min: usize,
+    pub expected: usize,
+}
+
+const MAX_CMD_0_ATTEMPTS: usize = 50;
+
+pub const MAX_SEND_CLOCKS: usize = 74 / 8;
