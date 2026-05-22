@@ -58,7 +58,10 @@ impl<const N: usize> SimpleCommand<N> {
         }
         match self.response.into_array() {
             Ok(res) => SimpleCmdProcess::Done(res),
-            Err(res) => SimpleCmdProcess::InProgress(Self { response: res }),
+            Err(res) => SimpleCmdProcess::InProgress(Self {
+                response: res,
+                phase: self.phase,
+            }),
         }
     }
 }
