@@ -1,4 +1,4 @@
-use core::{mem, num::NonZero};
+use core::{cmp::min, mem, num::NonZero};
 
 use crc::{CRC_16_XMODEM, Crc, Table};
 use embedded_hal::digital::PinState;
@@ -675,3 +675,97 @@ pub struct TransferInfo {
 const MAX_CMD_0_ATTEMPTS: usize = 50;
 
 pub const MAX_SEND_CLOCKS: usize = 74 / 8;
+
+const CMD_0_MAX_N: usize = 2;
+const CMD_0_EXPECTED_N: usize = 2;
+
+#[derive(defmt::Format)]
+enum Cmd0Phase {
+    SendCommand(usize),
+    WaitForR1(usize),
+}
+
+#[derive(defmt::Format)]
+pub struct Cmd0 {
+    phase: Cmd0Phase,
+}
+
+impl Default for Cmd0 {
+    fn default() -> Self {
+        Self {
+            phase: Cmd0Phase::SendCommand(0),
+        }
+    }
+}
+
+impl Cmd0 {
+    pub fn transfer(&self) -> TransferInfo2 {
+        match self.phase {
+            Cmd0Phase::SendCommand(bytes_sent) => TransferInfo2 {
+                write_count: size_of::<Command>() - bytes_sent,
+                transfer_min: size_of::<Command>() - bytes_sent + size_of::<R1>(),
+                transfer_expected: size_of::<Command>() - bytes_sent
+                    + CMD_0_EXPECTED_N
+                    + size_of::<R1>(),
+                transfer_max: size_of::<Command>() - bytes_sent + CMD_0_MAX_N + size_of::<R1>(),
+            },
+            Cmd0Phase::WaitForR1(bytes_received) => TransferInfo2 {
+                write_count: 0,
+                transfer_min: size_of::<R1>(),
+                transfer_expected: CMD_0_EXPECTED_N.saturating_sub(bytes_received)
+                    + size_of::<R1>(),
+                transfer_max: CMD_0_MAX_N - bytes_received + size_of::<R1>(),
+            },
+        }
+    }
+
+    pub fn prepare_buffer(&self, buffer: &mut [u8]) {
+        match self.phase {
+            Cmd0Phase::SendCommand(bytes_sent) => {
+                let command = format_cmd_0();
+                let bytes_to_copy = min(command.len() - bytes_sent, buffer.len());
+                buffer[..bytes_to_copy]
+                    .copy_from_slice(&command[bytes_sent..bytes_sent + bytes_to_copy]);
+            }
+            Cmd0Phase::WaitForR1(_) => {}
+        }
+    }
+
+    pub fn process_data(mut self, mut data: &[u8]) -> Cmd0O {
+        if let Cmd0Phase::SendCommand(bytes_sent) = self.phase {
+            let bytes_remaining = size_of::<Command>() - bytes_sent;
+            if data.len() >= bytes_remaining {
+                self.phase = Cmd0Phase::WaitForR1(0);
+                data = &data[bytes_remaining..];
+            } else {
+                self.phase = Cmd0Phase::SendCommand(bytes_sent + data.len())
+            }
+        }
+        if let Cmd0Phase::WaitForR1(bytes_received) = self.phase {
+            let r1 = data.iter().copied().find(|byte| *byte != 0xFF);
+            if let Some(r1) = r1 {
+                return Cmd0O::Done(Ok(r1));
+            } else {
+                let bytes_received = bytes_received + data.len();
+                if bytes_received > CMD_0_MAX_N {
+                    return Cmd0O::Done(Err(()));
+                }
+                self.phase = Cmd0Phase::WaitForR1(bytes_received);
+            }
+        }
+        Cmd0O::InProgress(self)
+    }
+}
+
+#[derive(defmt::Format)]
+pub enum Cmd0O {
+    InProgress(Cmd0),
+    Done(Result<u8, ()>),
+}
+
+pub struct TransferInfo2 {
+    pub write_count: usize,
+    pub transfer_min: usize,
+    pub transfer_expected: usize,
+    pub transfer_max: usize,
+}
